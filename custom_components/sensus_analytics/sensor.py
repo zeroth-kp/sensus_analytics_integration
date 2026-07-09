@@ -87,6 +87,28 @@ class UsageConversionMixin:
         # Fallback to API-reported unit if config is unexpected
         return self.coordinator.data.get("usageUnit")
 
+    def _get_last_completed_hour_entry(self):
+        """Return the hourly entry for the most recent completed hour.
+
+        Selects by real timestamp rather than by hour-of-day: the entry with
+        the latest timestamp that falls before the start of the current hour.
+        This avoids returning the in-progress hour or a stale same-hour entry
+        from a previous day when the API is still serving yesterday's array.
+        """
+        hourly_data = self.coordinator.data.get("hourly_usage_data", [])
+        if not hourly_data:
+            return None
+
+        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
+        now = datetime.now(local_tz)
+        current_hour_start = now.replace(minute=0, second=0, microsecond=0)
+        cutoff_ms = current_hour_start.timestamp() * 1000
+
+        completed = [entry for entry in hourly_data if entry.get("timestamp", 0) < cutoff_ms]
+        if not completed:
+            return None
+        return max(completed, key=lambda entry: entry["timestamp"])
+
 
 class DynamicUnitSensorBase(UsageConversionMixin, CoordinatorEntity, SensorEntity):
     """Base class for sensors with dynamic units."""
@@ -446,22 +468,11 @@ class LastHourUsageSensor(DynamicUnitSensorBase):
 
     @property
     def native_value(self):
-        """Return the usage for the current hour from the previous day."""
-        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
-        now = datetime.now(local_tz)
-        target_hour = now.hour
-        hourly_data = self.coordinator.data.get("hourly_usage_data", [])
-        if not hourly_data:
+        """Return the usage for the most recent completed hour."""
+        entry = self._get_last_completed_hour_entry()
+        if entry is None:
             return None
-
-        # Find the data corresponding to target_hour from the previous day
-        for entry in hourly_data:
-            entry_time = dt_util.utc_from_timestamp(entry["timestamp"] / 1000).astimezone(local_tz)
-            if entry_time.hour == target_hour:
-                usage = entry["usage"]
-                usage_unit = entry.get("usage_unit")
-                return self._convert_usage(usage, usage_unit)
-        return None
+        return self._convert_usage(entry["usage"], entry.get("usage_unit"))
 
 
 class LastHourRainfallSensor(StaticUnitSensorBase):
@@ -476,20 +487,11 @@ class LastHourRainfallSensor(StaticUnitSensorBase):
 
     @property
     def native_value(self):
-        """Return the rainfall for the current hour from the previous day."""
-        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
-        now = datetime.now(local_tz)
-        target_hour = now.hour
-        hourly_data = self.coordinator.data.get("hourly_usage_data", [])
-        if not hourly_data:
+        """Return the rainfall for the most recent completed hour."""
+        entry = self._get_last_completed_hour_entry()
+        if entry is None:
             return None
-
-        for entry in hourly_data:
-            entry_time = dt_util.utc_from_timestamp(entry["timestamp"] / 1000).astimezone(local_tz)
-            if entry_time.hour == target_hour:
-                rain = entry["rain"]
-                return rain
-        return None
+        return entry["rain"]
 
 
 class LastHourTemperatureSensor(StaticUnitSensorBase):
@@ -504,20 +506,11 @@ class LastHourTemperatureSensor(StaticUnitSensorBase):
 
     @property
     def native_value(self):
-        """Return the temperature for the current hour from the previous day."""
-        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
-        now = datetime.now(local_tz)
-        target_hour = now.hour
-        hourly_data = self.coordinator.data.get("hourly_usage_data", [])
-        if not hourly_data:
+        """Return the temperature for the most recent completed hour."""
+        entry = self._get_last_completed_hour_entry()
+        if entry is None:
             return None
-
-        for entry in hourly_data:
-            entry_time = dt_util.utc_from_timestamp(entry["timestamp"] / 1000).astimezone(local_tz)
-            if entry_time.hour == target_hour:
-                temp = entry["temp"]
-                return temp
-        return None
+        return entry["temp"]
 
 
 class LastHourTimestampSensor(StaticUnitSensorBase):
@@ -532,18 +525,10 @@ class LastHourTimestampSensor(StaticUnitSensorBase):
 
     @property
     def native_value(self):
-        """Return the timestamp for the current hour's data from the previous day."""
-        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
-        now = datetime.now(local_tz)
-        target_hour = now.hour
-        hourly_data = self.coordinator.data.get("hourly_usage_data", [])
-        if not hourly_data:
+        """Return the timestamp for the most recent completed hour's data."""
+        entry = self._get_last_completed_hour_entry()
+        if entry is None:
             return None
-
-        for entry in hourly_data:
-            entry_timestamp_ms = entry["timestamp"]
-            entry_time = dt_util.utc_from_timestamp(entry_timestamp_ms / 1000).astimezone(local_tz)
-            if entry_time.hour == target_hour:
-                # Return the timestamp as a formatted string
-                return entry_time.strftime("%Y-%m-%d %H:%M:%S")
-        return None
+        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
+        entry_time = dt_util.utc_from_timestamp(entry["timestamp"] / 1000).astimezone(local_tz)
+        return entry_time.strftime("%Y-%m-%d %H:%M:%S")
