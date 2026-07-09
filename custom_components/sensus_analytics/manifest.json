@@ -1,9 +1,9 @@
 {
   "domain": "sensus_analytics",
   "name": "Sensus Analytics Integration",
-  "version": "1.7.5",
+  "version": "1.8.0",
   "documentation": "https://github.com/zestysoft/sensus_analytics_integration",
-  "dependencies": [],
+  "dependencies": ["recorder"],
   "codeowners": ["@zestysoft"],
   "requirements": [],
   "iot_class": "cloud_polling",
