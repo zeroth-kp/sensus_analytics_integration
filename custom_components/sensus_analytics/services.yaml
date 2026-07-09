@@ -18,3 +18,25 @@ backfill_hourly_statistics:
           step: 1
           unit_of_measurement: hours
           mode: box
+
+backfill_daily_history:
+  name: Backfill daily history
+  description: >-
+    One-time backfill of the Daily Usage long-term statistics with historical
+    data: full calendar months before the cutover date (from Sensus's
+    pre-aggregated monthly totals), then real daily figures from the start of
+    that month through the cutover date itself - correcting any days already
+    recorded but undercounted due to late settlement. Written as one
+    continuously-increasing cumulative sum so it connects seamlessly with the
+    entity's existing live data.
+  fields:
+    cutover_date:
+      name: Cutover date
+      description: >-
+        Existing statistics on/after this date are corrected and reconnected
+        to the new cumulative sum; everything before it is backfilled from
+        Sensus's historical monthly/daily data.
+      required: true
+      example: "2026-07-05"
+      selector:
+        date: {}

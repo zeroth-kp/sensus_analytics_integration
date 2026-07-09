@@ -367,3 +367,185 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             return round(usage_float / CF_TO_GALLON / CF_PER_CCF, 2)
 
         return usage_float
+
+    # ------------------------------------------------------------------
+    # One-time historical backfill for Daily Usage
+    #
+    # Sensus's `zoom=year` view returns pre-aggregated monthly totals
+    # covering roughly the last 12 months per page; paginating further
+    # back is done by re-requesting with `end` set to just before the
+    # previous page's `start`, following `hasPrev` until it runs out.
+    # `zoom=month` returns a real daily-granularity rolling ~60-day
+    # window. Neither goes back further than Sensus itself retains.
+    #
+    # This backfills sensor.*_daily_usage's own long-term statistics:
+    # full calendar months before `cutover_date`, then real daily
+    # figures for the partial month(s) up to and including that date -
+    # which also corrects any days HA already recorded but undercounted
+    # due to late settlement (the same issue fixed for the hourly
+    # sensor). Everything is written as one continuously-increasing
+    # cumulative sum so there's no seam between backfilled history and
+    # the live entity's ongoing data.
+    # ------------------------------------------------------------------
+
+    async def async_backfill_daily_history(self, cutover_date) -> int:
+        """Backfill sensor.*_daily_usage's long-term statistics before ``cutover_date``.
+
+        ``cutover_date`` is a date; existing statistics on/after this date are
+        overwritten with corrected values and shifted onto the same continuous
+        sum. Returns the number of statistics rows imported.
+        """
+        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
+        boundary_local = datetime.combine(cutover_date, datetime.min.time(), tzinfo=local_tz)
+        boundary_month_start = boundary_local.replace(day=1)
+
+        monthly_totals, daily_entries = await self.hass.async_add_executor_job(
+            self._fetch_daily_history_window, boundary_month_start, boundary_local
+        )
+
+        statistic_id = self._resolve_daily_usage_statistic_id()
+        config_unit = self.config_entry.data.get("unit_type")
+        unit = config_unit if config_unit in ("gal", "CCF") else None
+
+        statistics = []
+        running_sum = 0.0
+        for start, usage, usage_unit in monthly_totals + daily_entries:
+            value = self._convert_usage_value(usage, usage_unit)
+            if value is None:
+                continue
+            running_sum += value
+            statistics.append(
+                StatisticData(
+                    start=start,
+                    state=value,
+                    sum=running_sum,
+                    last_reset=start,
+                )
+            )
+
+        if not statistics:
+            _LOGGER.warning("Daily history backfill: no convertible usage values found")
+            return 0
+
+        metadata = StatisticMetaData(
+            has_sum=True,
+            name=None,
+            source="recorder",
+            statistic_id=statistic_id,
+            unit_of_measurement=unit,
+        )
+        if _MEAN_NONE is not None:
+            metadata["mean_type"] = _MEAN_NONE
+        else:
+            metadata["has_mean"] = False
+        async_import_statistics(self.hass, metadata, statistics)
+        _LOGGER.info(
+            "Daily history backfill: imported %s statistics row(s) for %s",
+            len(statistics),
+            statistic_id,
+        )
+        return len(statistics)
+
+    def _resolve_daily_usage_statistic_id(self) -> str:
+        """Return the entity_id (statistic_id) of the Daily Usage sensor."""
+        unique_id = f"{DOMAIN}_{self.config_entry.entry_id}_daily_usage"
+        entity_registry = er.async_get(self.hass)
+        entity_id = entity_registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+        return entity_id or "sensor.sensus_analytics_daily_usage"
+
+    def _fetch_daily_history_window(self, boundary_month_start: datetime, boundary_local: datetime):
+        """Fetch monthly totals before the boundary month, plus real daily data
+        from the boundary month through the cutover date (runs in executor).
+        """
+        session = self._create_authenticated_session()
+        local_tz = boundary_local.tzinfo
+
+        monthly_totals = []
+        end_ms = int(datetime.now(local_tz).timestamp() * 1000)
+        for _ in range(60):  # safety cap; Sensus currently retains ~24 months
+            page = self._fetch_yearly_page(session, end_ms)
+            if not page:
+                break
+            entries, has_prev, page_start_ms = page
+            for ts_ms, usage, usage_unit in entries:
+                entry_time = dt_util.utc_from_timestamp(ts_ms / 1000).astimezone(local_tz)
+                if entry_time >= boundary_month_start:
+                    continue
+                monthly_totals.append((dt_util.as_utc(entry_time), usage, usage_unit))
+            if not has_prev or page_start_ms is None:
+                break
+            end_ms = page_start_ms - 1
+
+        monthly_totals.sort(key=lambda row: row[0])
+
+        daily_entries = []
+        for ts_ms, usage, usage_unit in self._fetch_recent_daily_window(session):
+            entry_time = dt_util.utc_from_timestamp(ts_ms / 1000).astimezone(local_tz)
+            if boundary_month_start <= entry_time <= boundary_local:
+                daily_entries.append((dt_util.as_utc(entry_time), usage, usage_unit))
+        daily_entries.sort(key=lambda row: row[0])
+
+        return monthly_totals, daily_entries
+
+    def _fetch_yearly_page(self, session, end_ms: int):
+        """Fetch one zoom=year page ending at ``end_ms``.
+
+        Returns (entries, has_prev, page_start_ms) or None on failure.
+        """
+        usage_url = urljoin(self.base_url, f"water/usage/{self.account_number}/{self.meter_number}")
+        params = {
+            "start": end_ms - (400 * 24 * 3600 * 1000),
+            "end": end_ms,
+            "zoom": "year",
+            "page": "null",
+            "weather": "1",
+        }
+        try:
+            response = session.get(usage_url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.RequestException as e:
+            _LOGGER.error("Yearly data retrieval failed: %s", e)
+            return None
+
+        if not data.get("operationSuccess", False):
+            return None
+
+        payload = data.get("data", {})
+        usage_list = payload.get("usage", [])
+        if not usage_list or len(usage_list) < 2:
+            return None
+
+        usage_unit = usage_list[0][0]
+        entries = [(row[0], row[1], usage_unit) for row in usage_list[1:]]
+        return entries, bool(payload.get("hasPrev")), payload.get("start")
+
+    def _fetch_recent_daily_window(self, session):
+        """Fetch the recent rolling daily-granularity window (zoom=month)."""
+        usage_url = urljoin(self.base_url, f"water/usage/{self.account_number}/{self.meter_number}")
+        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
+        now_local = datetime.now(local_tz)
+        params = {
+            "start": int((now_local - timedelta(days=60)).timestamp() * 1000),
+            "end": int(now_local.timestamp() * 1000),
+            "zoom": "month",
+            "page": "null",
+            "weather": "1",
+        }
+        try:
+            response = session.get(usage_url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.RequestException as e:
+            _LOGGER.error("Recent daily window retrieval failed: %s", e)
+            return []
+
+        if not data.get("operationSuccess", False):
+            return []
+
+        usage_list = data.get("data", {}).get("usage", [])
+        if not usage_list or len(usage_list) < 2:
+            return []
+
+        usage_unit = usage_list[0][0]
+        return [(row[0], row[1], usage_unit) for row in usage_list[1:]]
