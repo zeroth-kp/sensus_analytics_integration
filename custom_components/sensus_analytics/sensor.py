@@ -9,7 +9,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import DEFAULT_NAME, DOMAIN
+from .const import CONF_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_NAME, DOMAIN
 
 CF_TO_GALLON = 7.48052
 CF_PER_CCF = 100  # 1 CCF = 100 cubic feet
@@ -88,12 +88,19 @@ class UsageConversionMixin:
         return self.coordinator.data.get("usageUnit")
 
     def _get_last_completed_hour_entry(self):
-        """Return the hourly entry for the most recent completed hour.
+        """Return the hourly entry for the most recent settled hour.
 
         Selects by real timestamp rather than by hour-of-day: the entry with
-        the latest timestamp that falls before the start of the current hour.
-        This avoids returning the in-progress hour or a stale same-hour entry
-        from a previous day when the API is still serving yesterday's array.
+        the latest timestamp whose hour ended at least CONF_HOUR_SETTLE_DELAY_MINUTES
+        ago. This avoids returning the in-progress hour or a stale same-hour
+        entry from a previous day when the API is still serving yesterday's
+        array. The delay also guards against Sensus itself not having settled
+        a just-completed hour's reading yet - e.g. the last hour or two of a
+        day can still read 0 up to an hour after they ended, only reaching
+        their true value sometime after midnight. A configurable delay
+        reduces how often the live sensor shows one of these provisional
+        values, though it isn't a guarantee - the nightly backfill service
+        remains the source of truth for already-recorded statistics.
         """
         hourly_data = self.coordinator.data.get("hourly_usage_data", [])
         if not hourly_data:
@@ -101,8 +108,12 @@ class UsageConversionMixin:
 
         local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
         now = datetime.now(local_tz)
-        current_hour_start = now.replace(minute=0, second=0, microsecond=0)
-        cutoff_ms = current_hour_start.timestamp() * 1000
+        delay_minutes = self.coordinator.config_entry.data.get(
+            CONF_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_HOUR_SETTLE_DELAY_MINUTES
+        )
+        settled_before = now - timedelta(minutes=delay_minutes)
+        cutoff_hour_start = settled_before.replace(minute=0, second=0, microsecond=0)
+        cutoff_ms = cutoff_hour_start.timestamp() * 1000
 
         completed = [entry for entry in hourly_data if entry.get("timestamp", 0) < cutoff_ms]
         if not completed:

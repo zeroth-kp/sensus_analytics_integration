@@ -11,7 +11,16 @@ from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import config_validation as cv
 
-from .const import CONF_ACCOUNT_NUMBER, CONF_BASE_URL, CONF_METER_NUMBER, CONF_PASSWORD, CONF_USERNAME, DOMAIN
+from .const import (
+    CONF_ACCOUNT_NUMBER,
+    CONF_BASE_URL,
+    CONF_HOUR_SETTLE_DELAY_MINUTES,
+    CONF_METER_NUMBER,
+    CONF_PASSWORD,
+    CONF_USERNAME,
+    DEFAULT_HOUR_SETTLE_DELAY_MINUTES,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +66,10 @@ class SensusAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Optional("tier2_price"): cv.positive_float,
                 vol.Optional("tier3_price"): cv.positive_float,
                 vol.Required("service_fee", default=15.00): cv.positive_float,
+                vol.Optional(
+                    CONF_HOUR_SETTLE_DELAY_MINUTES,
+                    default=DEFAULT_HOUR_SETTLE_DELAY_MINUTES,
+                ): cv.positive_int,
             }
         )
         return self.async_show_form(step_id="user", data_schema=data_schema, errors=errors)
@@ -154,6 +167,12 @@ class SensusAnalyticsOptionsFlow(config_entries.OptionsFlow):
                     "service_fee",
                     default=current_data.get("service_fee", 15.00),
                 ): cv.positive_float,
+                vol.Optional(
+                    CONF_HOUR_SETTLE_DELAY_MINUTES,
+                    default=current_data.get(
+                        CONF_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_HOUR_SETTLE_DELAY_MINUTES
+                    ),
+                ): cv.positive_int,
             }
         )
 
