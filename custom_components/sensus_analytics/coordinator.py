@@ -48,12 +48,18 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             # Fetch daily data
             data = self._fetch_daily_data(session)
 
-            # Fetch hourly data
+            # Fetch hourly data. Sensus now publishes same-day hourly data on
+            # demand, so try today first and only fall back to yesterday if
+            # today's data isn't available yet (preserves prior behavior for
+            # accounts/times where it still lags).
             _LOGGER.debug("Fetching hourly data")
             local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
             now_local = datetime.now(local_tz)
-            target_date = now_local - timedelta(days=1)
-            hourly_data = self._retrieve_hourly_data(session, target_date)
+            hourly_data = self._retrieve_hourly_data(session, now_local)
+            if not hourly_data:
+                target_date = now_local - timedelta(days=1)
+                hourly_data = self._retrieve_hourly_data(session, target_date)
+
             if hourly_data:
                 data["hourly_usage_data"] = hourly_data
             else:
