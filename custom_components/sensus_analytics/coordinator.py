@@ -391,9 +391,12 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
     async def async_backfill_daily_history(self, cutover_date) -> int:
         """Backfill sensor.*_daily_usage's long-term statistics before ``cutover_date``.
 
-        ``cutover_date`` is a date; existing statistics on/after this date are
-        overwritten with corrected values and shifted onto the same continuous
-        sum. Returns the number of statistics rows imported.
+        ``cutover_date`` only controls where the monthly-aggregate backfill
+        stops - full calendar months before it come from Sensus's
+        pre-aggregated monthly totals. From the start of that month through
+        today, real daily figures are used instead, which also corrects any
+        already-recorded days that were undercounted. Returns the number of
+        statistics rows imported.
         """
         local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
         boundary_local = datetime.combine(cutover_date, datetime.min.time(), tzinfo=local_tz)
@@ -407,21 +410,54 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         config_unit = self.config_entry.data.get("unit_type")
         unit = config_unit if config_unit in ("gal", "CCF") else None
 
+        # HA's day/month aggregation reads the *last* existing hourly row of each
+        # calendar day as that day's ending total - it is not recomputed live from
+        # a single imported row. Any day that already has real hourly history (an
+        # entity that's been running a few days, say) needs every one of those
+        # existing hours overwritten, or the day view keeps reading the old
+        # (uncorrected) value from whatever hour happens to be last, regardless of
+        # what we write to the day's first/midnight hour.
+        existing_hours_by_day = await self._get_existing_hours_by_day(
+            statistic_id, boundary_month_start, local_tz
+        )
+
         statistics = []
         running_sum = 0.0
-        for start, usage, usage_unit in monthly_totals + daily_entries:
+
+        # Monthly rows are always a true historical gap - no existing hourly data
+        # can exist that far back - so a single row per month is sufficient.
+        for start, usage, usage_unit in monthly_totals:
             value = self._convert_usage_value(usage, usage_unit)
             if value is None:
                 continue
             running_sum += value
             statistics.append(
-                StatisticData(
-                    start=start,
-                    state=value,
-                    sum=running_sum,
-                    last_reset=start,
-                )
+                StatisticData(start=start, state=value, sum=running_sum, last_reset=start)
             )
+
+        for start, usage, usage_unit in daily_entries:
+            value = self._convert_usage_value(usage, usage_unit)
+            if value is None:
+                continue
+            day_start_sum = running_sum
+            running_sum += value
+            existing_hours = existing_hours_by_day.get(start.astimezone(local_tz).date())
+            if existing_hours:
+                # Flatten every existing hour except the last (no incremental
+                # change), then land the day's full corrected total on the last
+                # one - that's the row HA's day/month views actually read.
+                for hour in existing_hours[:-1]:
+                    statistics.append(
+                        StatisticData(start=hour, state=0, sum=day_start_sum, last_reset=hour)
+                    )
+                last_hour = existing_hours[-1]
+                statistics.append(
+                    StatisticData(start=last_hour, state=value, sum=running_sum, last_reset=last_hour)
+                )
+            else:
+                statistics.append(
+                    StatisticData(start=start, state=value, sum=running_sum, last_reset=start)
+                )
 
         if not statistics:
             _LOGGER.warning("Daily history backfill: no convertible usage values found")
@@ -446,6 +482,29 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         )
         return len(statistics)
 
+    async def _get_existing_hours_by_day(self, statistic_id: str, start_time: datetime, local_tz) -> dict:
+        """Return existing statistics hour start-datetimes, grouped by local calendar date."""
+        stats = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            start_time,
+            None,
+            {statistic_id},
+            "hour",
+            None,
+            {"sum"},
+        )
+        rows = stats.get(statistic_id) if stats else []
+        by_day: dict = {}
+        for row in rows:
+            # statistics_during_period returns "start" as raw epoch seconds.
+            dt_utc = dt_util.utc_from_timestamp(row["start"])
+            dt_local = dt_utc.astimezone(local_tz)
+            by_day.setdefault(dt_local.date(), []).append(dt_utc)
+        for day_hours in by_day.values():
+            day_hours.sort()
+        return by_day
+
     def _resolve_daily_usage_statistic_id(self) -> str:
         """Return the entity_id (statistic_id) of the Daily Usage sensor."""
         unique_id = f"{DOMAIN}_{self.config_entry.entry_id}_daily_usage"
@@ -455,7 +514,12 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
 
     def _fetch_daily_history_window(self, boundary_month_start: datetime, boundary_local: datetime):
         """Fetch monthly totals before the boundary month, plus real daily data
-        from the boundary month through the cutover date (runs in executor).
+        from the boundary month through today (runs in executor).
+
+        ``boundary_local`` (the cutover date) only controls where the monthly
+        backfill stops - the daily correction window always extends through
+        the present, since the goal is to fix every already-recorded day that
+        might be undercounted, not just the ones before the cutover.
         """
         session = self._create_authenticated_session()
         local_tz = boundary_local.tzinfo
@@ -481,7 +545,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         daily_entries = []
         for ts_ms, usage, usage_unit in self._fetch_recent_daily_window(session):
             entry_time = dt_util.utc_from_timestamp(ts_ms / 1000).astimezone(local_tz)
-            if boundary_month_start <= entry_time <= boundary_local:
+            if entry_time >= boundary_month_start:
                 daily_entries.append((dt_util.as_utc(entry_time), usage, usage_unit))
         daily_entries.sort(key=lambda row: row[0])
 
