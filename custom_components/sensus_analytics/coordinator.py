@@ -5,13 +5,33 @@ from datetime import datetime, timedelta
 from urllib.parse import urljoin
 
 import requests
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.statistics import async_import_statistics, statistics_during_period
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_ACCOUNT_NUMBER, CONF_BASE_URL, CONF_METER_NUMBER, CONF_PASSWORD, CONF_USERNAME, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
+
+# StatisticMetaData replaced the ``has_mean`` bool with ``mean_type`` during the
+# 2025.x cycle. Import the enum when available and fall back for older cores so
+# the backfill works across HA versions.
+try:  # HA >= 2025.2
+    from homeassistant.components.recorder.models import StatisticData, StatisticMeanType, StatisticMetaData
+
+    _MEAN_NONE = StatisticMeanType.NONE
+except ImportError:  # pragma: no cover - older HA cores
+    from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+
+    _MEAN_NONE = None
+
+# Usage conversion constants (mirror sensor.py; kept local to avoid importing
+# the sensor module from the coordinator).
+CF_TO_GALLON = 7.48052
+CF_PER_CCF = 100  # 1 CCF = 100 cubic feet
 
 
 class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
@@ -205,3 +225,145 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             )
 
         return hourly_entries
+
+    # ------------------------------------------------------------------
+    # One-time hourly-statistics backfill
+    #
+    # Older versions always fetched *yesterday's* hourly array and matched
+    # today's hour-of-day against it, so the Last Hour Usage sensor persisted
+    # yesterday's usage shape under today's timestamps. This backfill re-imports
+    # the last N hours using each entry's real timestamp, overwriting the
+    # mislabeled long-term statistics rows for that sensor.
+    # ------------------------------------------------------------------
+
+    async def async_backfill_hourly_statistics(self, hours: int = 24) -> int:
+        """Backfill the Last Hour Usage long-term statistics for the last N hours.
+
+        Returns the number of hourly statistics rows imported.
+        """
+        entries = await self.hass.async_add_executor_job(self._fetch_hourly_window, hours)
+        if not entries:
+            _LOGGER.warning("Hourly backfill: no hourly data available to import")
+            return 0
+
+        statistic_id = self._resolve_usage_statistic_id()
+        config_unit = self.config_entry.data.get("unit_type")
+        unit = config_unit if config_unit in ("gal", "CCF") else None
+
+        first_start = self._floor_to_hour_utc(entries[0]["timestamp"])
+        baseline_sum = await self._get_baseline_sum(statistic_id, first_start)
+
+        statistics = []
+        running_sum = baseline_sum
+        for entry in entries:
+            value = self._convert_usage_value(entry["usage"], entry.get("usage_unit"))
+            if value is None:
+                continue
+            start = self._floor_to_hour_utc(entry["timestamp"])
+            running_sum += value
+            statistics.append(
+                StatisticData(
+                    start=start,
+                    state=value,
+                    sum=running_sum,
+                    last_reset=start,
+                )
+            )
+
+        if not statistics:
+            _LOGGER.warning("Hourly backfill: no convertible usage values found")
+            return 0
+
+        metadata = StatisticMetaData(
+            has_sum=True,
+            name=None,
+            source="recorder",
+            statistic_id=statistic_id,
+            unit_of_measurement=unit,
+        )
+        # Populate the mean field under whichever key this HA core expects.
+        if _MEAN_NONE is not None:
+            metadata["mean_type"] = _MEAN_NONE
+        else:
+            metadata["has_mean"] = False
+        async_import_statistics(self.hass, metadata, statistics)
+        _LOGGER.info(
+            "Hourly backfill: imported %s hourly statistics rows for %s",
+            len(statistics),
+            statistic_id,
+        )
+        return len(statistics)
+
+    def _fetch_hourly_window(self, hours: int):
+        """Fetch and merge the last ``hours`` of hourly entries (runs in executor)."""
+        session = self._create_authenticated_session()
+        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
+        now_local = datetime.now(local_tz)
+
+        # Pull enough calendar days to fully cover the requested window. Add one
+        # extra day so a window that straddles midnight is always complete.
+        days_to_fetch = (hours // 24) + 2
+        combined = {}
+        for day_offset in range(days_to_fetch):
+            target_date = now_local - timedelta(days=day_offset)
+            day_entries = self._retrieve_hourly_data(session, target_date)
+            if not day_entries:
+                continue
+            for entry in day_entries:
+                # Dedupe by timestamp (today/yesterday windows can overlap).
+                combined[entry["timestamp"]] = entry
+
+        cutoff_ms = int((now_local - timedelta(hours=hours)).timestamp() * 1000)
+        window = [entry for ts, entry in combined.items() if ts >= cutoff_ms]
+        window.sort(key=lambda entry: entry["timestamp"])
+        return window
+
+    def _resolve_usage_statistic_id(self) -> str:
+        """Return the entity_id (statistic_id) of the Last Hour Usage sensor."""
+        unique_id = f"{DOMAIN}_{self.config_entry.entry_id}_last_hour_usage"
+        entity_registry = er.async_get(self.hass)
+        entity_id = entity_registry.async_get_entity_id("sensor", DOMAIN, unique_id)
+        return entity_id or "sensor.sensus_analytics_last_hour_usage"
+
+    async def _get_baseline_sum(self, statistic_id: str, window_start: datetime) -> float:
+        """Return the cumulative sum of the hour immediately before the window."""
+        stats = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            window_start - timedelta(hours=1),
+            window_start,
+            {statistic_id},
+            "hour",
+            None,
+            {"sum"},
+        )
+        rows = stats.get(statistic_id) if stats else None
+        if rows:
+            return rows[-1].get("sum") or 0.0
+        return 0.0
+
+    @staticmethod
+    def _floor_to_hour_utc(timestamp_ms: int) -> datetime:
+        """Convert a ms epoch timestamp to a UTC datetime floored to the hour."""
+        return dt_util.utc_from_timestamp(timestamp_ms / 1000).replace(minute=0, second=0, microsecond=0)
+
+    def _convert_usage_value(self, usage, usage_unit):
+        """Convert a native usage value to the configured unit (mirrors sensor.py)."""
+        if usage is None:
+            return None
+        config_unit = self.config_entry.data.get("unit_type")
+        try:
+            usage_float = float(usage)
+        except (ValueError, TypeError):
+            return None
+
+        if usage_unit == "CF" and config_unit == "gal":
+            return round(usage_float * CF_TO_GALLON)
+        if usage_unit == "CF" and config_unit == "CCF":
+            return round(usage_float / CF_PER_CCF, 2)
+        if usage_unit == "GAL" and config_unit == "gal":
+            return usage_float
+        if usage_unit == "GAL" and config_unit == "CCF":
+            return round(usage_float / CF_TO_GALLON / CF_PER_CCF, 2)
+
+        return usage_float
