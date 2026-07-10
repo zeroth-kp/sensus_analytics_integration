@@ -326,11 +326,23 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         return entity_id or "sensor.sensus_analytics_last_hour_usage"
 
     async def _get_baseline_sum(self, statistic_id: str, window_start: datetime) -> float:
-        """Return the cumulative sum of the hour immediately before the window."""
+        """Return the cumulative sum of the most recent hour before the window.
+
+        Looks back up to 7 days, not just the single immediately-preceding
+        hour - a fetch that comes back thinner than expected (e.g. only
+        today's data, if yesterday's/day-before's API calls silently
+        returned nothing) would otherwise make window_start land right at
+        the start of real history, find no row in that single adjacent
+        hour, and fall back to 0.0 - resetting the cumulative sum and
+        corrupting every hour from there forward. This can happen when a
+        fetch returns much less than the requested window (e.g. only
+        same-day data instead of several days), leaving the 1-hour
+        lookback nothing to anchor to.
+        """
         stats = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
-            window_start - timedelta(hours=1),
+            window_start - timedelta(days=7),
             window_start,
             {statistic_id},
             "hour",
