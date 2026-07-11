@@ -468,14 +468,18 @@ class LastHourUsageSensor(DynamicUnitSensorBase):
         self._attr_unique_id = f"{self._unique_id}_last_hour_usage"
         self._attr_icon = "mdi:water"
         self._attr_device_class = SensorDeviceClass.WATER
-        self._attr_state_class = SensorStateClass.TOTAL
-
-    @property
-    def last_reset(self):
-        """Return the last reset time for the last hour usage sensor."""
-        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
-        now = datetime.now(local_tz)
-        return now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        # Deliberately no state_class: this sensor's long-term statistics are
+        # written exclusively by async_backfill_hourly_statistics (see
+        # coordinator.py), which re-derives each hour's real timestamp from
+        # the Sensus API rather than trusting HA's own compile-time "now".
+        # Setting state_class here made HA's native recorder ALSO try to
+        # auto-compile long-term stats for this entity from its raw states,
+        # racing the coordinator's own import for the same hour - the loser
+        # hits `UNIQUE constraint failed: statistics.metadata_id,
+        # statistics.start_ts`, and since HA batches every entity's hourly
+        # compile into one transaction, that single collision silently
+        # blocked long-term statistics for the *entire* recorder, not just
+        # this entity.
 
     @property
     def native_value(self):
