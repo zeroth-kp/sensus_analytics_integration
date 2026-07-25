@@ -11,3 +11,6 @@ CONF_HOUR_SETTLE_DELAY_MINUTES = "hour_settle_delay_minutes"
 
 DEFAULT_NAME = "Sensus Analytics"
 DEFAULT_HOUR_SETTLE_DELAY_MINUTES = 90
+
+CF_TO_GALLON = 7.48052
+CF_PER_CCF = 100  # 1 CCF = 100 cubic feet
