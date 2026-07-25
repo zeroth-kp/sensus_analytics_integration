@@ -10,9 +10,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_NAME, DOMAIN
-
-CF_TO_GALLON = 7.48052
-CF_PER_CCF = 100  # 1 CCF = 100 cubic feet
+from .usage_conversion import convert_usage_value
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
@@ -43,35 +41,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class UsageConversionMixin:
     """Mixin to provide usage conversion."""
 
-    # pylint: disable=too-many-return-statements
     def _convert_usage(self, usage, usage_unit=None):
         """Convert usage based on configuration and native unit."""
-        if usage is None:
-            return None
         if usage_unit is None:
             usage_unit = self.coordinator.data.get("usageUnit")
-
         config_unit_type = self.coordinator.config_entry.data.get("unit_type")
-
-        try:
-            usage_float = float(usage)
-        except (ValueError, TypeError):
-            return None
-
-        # CF (cubic feet) conversions
-        if usage_unit == "CF" and config_unit_type == "gal":
-            return round(usage_float * CF_TO_GALLON)
-        if usage_unit == "CF" and config_unit_type == "CCF":
-            return round(usage_float / CF_PER_CCF, 2)
-
-        # GAL (gallons) conversions
-        if usage_unit == "GAL" and config_unit_type == "gal":
-            return usage
-        if usage_unit == "GAL" and config_unit_type == "CCF":
-            # Convert gallons to cubic feet, then to CCF
-            return round(usage_float / CF_TO_GALLON / CF_PER_CCF, 2)
-
-        return usage
+        return convert_usage_value(usage, usage_unit, config_unit_type)
 
     def _get_usage_unit(self):
         """Determine the unit of measurement for usage sensors."""
@@ -174,12 +149,21 @@ class SensusAnalyticsDailyUsageSensor(DynamicUnitSensorBase):
         self._attr_unique_id = f"{self._unique_id}_daily_usage"
         self._attr_icon = "mdi:water"
         self._attr_device_class = SensorDeviceClass.WATER
-        self._attr_state_class = SensorStateClass.TOTAL
-
-    @property
-    def last_reset(self):
-        """Return the last reset time for the daily usage sensor."""
-        return dt_util.start_of_local_day()
+        # Deliberately no state_class: this sensor's long-term statistics are
+        # written exclusively by async_backfill_daily_history and the
+        # recurring async_refresh_recent_daily_statistics (see
+        # coordinator.py), which derive each day's real total from Sensus's
+        # daily/monthly history endpoints rather than trusting HA's own
+        # compile-time state snapshots. Setting state_class here made HA's
+        # native recorder ALSO try to auto-compile long-term stats for this
+        # entity from its raw states, racing the coordinator's own import for
+        # the same day/hour - the loser hits `UNIQUE constraint failed:
+        # statistics.metadata_id, statistics.start_ts`, and since HA batches
+        # every entity's hourly compile into one transaction, that single
+        # collision silently blocked long-term statistics for the *entire*
+        # recorder, not just this entity. This is the same collision class
+        # already fixed above for LastHourUsageSensor, now triggered by the
+        # daily-history backfill instead of the hourly one.
 
     @property
     def native_value(self):

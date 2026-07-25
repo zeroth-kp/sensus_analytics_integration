@@ -13,6 +13,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_ACCOUNT_NUMBER, CONF_BASE_URL, CONF_METER_NUMBER, CONF_PASSWORD, CONF_USERNAME, DOMAIN
+from .usage_conversion import convert_usage_value
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -27,11 +28,6 @@ except ImportError:  # pragma: no cover - older HA cores
     from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 
     _MEAN_NONE = None
-
-# Usage conversion constants (mirror sensor.py; kept local to avoid importing
-# the sensor module from the coordinator).
-CF_TO_GALLON = 7.48052
-CF_PER_CCF = 100  # 1 CCF = 100 cubic feet
 
 
 class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
@@ -360,25 +356,114 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         return dt_util.utc_from_timestamp(timestamp_ms / 1000).replace(minute=0, second=0, microsecond=0)
 
     def _convert_usage_value(self, usage, usage_unit):
-        """Convert a native usage value to the configured unit (mirrors sensor.py)."""
-        if usage is None:
-            return None
+        """Convert a native usage value to the configured unit."""
         config_unit = self.config_entry.data.get("unit_type")
-        try:
-            usage_float = float(usage)
-        except (ValueError, TypeError):
-            return None
+        return convert_usage_value(usage, usage_unit, config_unit)
 
-        if usage_unit == "CF" and config_unit == "gal":
-            return round(usage_float * CF_TO_GALLON)
-        if usage_unit == "CF" and config_unit == "CCF":
-            return round(usage_float / CF_PER_CCF, 2)
-        if usage_unit == "GAL" and config_unit == "gal":
-            return usage_float
-        if usage_unit == "GAL" and config_unit == "CCF":
-            return round(usage_float / CF_TO_GALLON / CF_PER_CCF, 2)
+    def _build_daily_statistics(self, daily_entries, existing_hours_by_day, local_tz, starting_sum=0.0):
+        """Build StatisticData rows for daily entries, overwriting any existing
+        hourly rows for days that already have real hourly history.
 
-        return usage_float
+        HA's day/month aggregation reads the *last* existing hourly row of
+        each calendar day as that day's ending total - it is not recomputed
+        live from a single imported row. Any day that already has real
+        hourly history needs every one of those existing hours overwritten,
+        or the day view keeps reading the old (uncorrected) value from
+        whatever hour happens to be last, regardless of what's written to
+        the day's first/midnight hour.
+
+        Shared by the one-time cutover backfill and the recurring scheduled
+        refresh (see async_backfill_daily_history and
+        async_refresh_recent_daily_statistics).
+        """
+        statistics = []
+        running_sum = starting_sum
+        for start, usage, usage_unit in daily_entries:
+            value = self._convert_usage_value(usage, usage_unit)
+            if value is None:
+                continue
+            day_start_sum = running_sum
+            running_sum += value
+            existing_hours = existing_hours_by_day.get(start.astimezone(local_tz).date())
+            if existing_hours:
+                # Flatten every existing hour except the last (no incremental
+                # change), then land the day's full corrected total on the last
+                # one - that's the row HA's day/month views actually read.
+                for hour in existing_hours[:-1]:
+                    statistics.append(StatisticData(start=hour, state=0, sum=day_start_sum, last_reset=hour))
+                last_hour = existing_hours[-1]
+                statistics.append(StatisticData(start=last_hour, state=value, sum=running_sum, last_reset=last_hour))
+            else:
+                statistics.append(StatisticData(start=start, state=value, sum=running_sum, last_reset=start))
+        return statistics, running_sum
+
+    # ------------------------------------------------------------------
+    # Recurring daily-statistics refresh
+    #
+    # SensusAnalyticsDailyUsageSensor deliberately has no state_class (see
+    # sensor.py) to avoid the same dual-writer recorder collision that was
+    # fixed for LastHourUsageSensor - which means HA's native recorder no
+    # longer auto-compiles long-term statistics for it. Without this
+    # recurring refresh, the sensor's statistics would only ever be as
+    # fresh as the last manual backfill_daily_history service call.
+    # ------------------------------------------------------------------
+
+    async def async_refresh_recent_daily_statistics(self, days: int = 3) -> int:
+        """Keep the Daily Usage sensor's long-term statistics fresh automatically.
+
+        Re-imports the last ``days`` days using the same real-daily-figures
+        and existing-hour-overwrite logic as the one-time historical
+        backfill, correcting for late-settling data along the way. Returns
+        the number of statistics rows imported.
+        """
+        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
+        now_local = datetime.now(local_tz)
+        window_start_local = (now_local - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+        raw_entries = await self.hass.async_add_executor_job(
+            self._fetch_daily_entries_for_refresh, window_start_local, now_local
+        )
+        daily_entries = [
+            (dt_util.as_utc(dt_util.utc_from_timestamp(ts_ms / 1000).astimezone(local_tz)), usage, usage_unit)
+            for ts_ms, usage, usage_unit in raw_entries
+        ]
+        if not daily_entries:
+            return 0
+
+        statistic_id = self._resolve_daily_usage_statistic_id()
+        config_unit = self.config_entry.data.get("unit_type")
+        unit = config_unit if config_unit in ("gal", "CCF") else None
+
+        existing_hours_by_day = await self._get_existing_hours_by_day(statistic_id, window_start_local, local_tz)
+        baseline_sum = await self._get_baseline_sum(statistic_id, dt_util.as_utc(window_start_local))
+        statistics, _ = self._build_daily_statistics(daily_entries, existing_hours_by_day, local_tz, baseline_sum)
+
+        if not statistics:
+            return 0
+
+        metadata = StatisticMetaData(
+            has_sum=True,
+            name=None,
+            source="recorder",
+            statistic_id=statistic_id,
+            unit_of_measurement=unit,
+        )
+        if _MEAN_NONE is not None:
+            metadata["mean_type"] = _MEAN_NONE
+        else:
+            metadata["has_mean"] = False
+        async_import_statistics(self.hass, metadata, statistics)
+        _LOGGER.info(
+            "Scheduled daily refresh: imported %s statistics row(s) for %s",
+            len(statistics),
+            statistic_id,
+        )
+        return len(statistics)
+
+    def _fetch_daily_entries_for_refresh(self, start_local: datetime, end_local: datetime):
+        """Fetch daily entries for the scheduled refresh window (runs in executor)."""
+        session = self._create_authenticated_session()
+        return self._fetch_daily_entries_in_range(session, start_local, end_local)
 
     # ------------------------------------------------------------------
     # One-time historical backfill for Daily Usage
@@ -387,8 +472,12 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
     # covering roughly the last 12 months per page; paginating further
     # back is done by re-requesting with `end` set to just before the
     # previous page's `start`, following `hasPrev` until it runs out.
-    # `zoom=month` returns a real daily-granularity rolling ~60-day
-    # window. Neither goes back further than Sensus itself retains.
+    # `zoom=month` returns real daily-granularity data; the window
+    # requested is widened as needed to reach the cutover month (at
+    # least 60 days, more if the cutover is older), though Sensus's own
+    # daily-granularity retention may itself be capped below that - see
+    # the gap-detection warning in _fetch_daily_history_window. Neither
+    # endpoint goes back further than Sensus itself retains.
     #
     # This backfills sensor.*_daily_usage's own long-term statistics:
     # full calendar months before `cutover_date`, then real daily
@@ -443,23 +532,10 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             running_sum += value
             statistics.append(StatisticData(start=start, state=value, sum=running_sum, last_reset=start))
 
-        for start, usage, usage_unit in daily_entries:
-            value = self._convert_usage_value(usage, usage_unit)
-            if value is None:
-                continue
-            day_start_sum = running_sum
-            running_sum += value
-            existing_hours = existing_hours_by_day.get(start.astimezone(local_tz).date())
-            if existing_hours:
-                # Flatten every existing hour except the last (no incremental
-                # change), then land the day's full corrected total on the last
-                # one - that's the row HA's day/month views actually read.
-                for hour in existing_hours[:-1]:
-                    statistics.append(StatisticData(start=hour, state=0, sum=day_start_sum, last_reset=hour))
-                last_hour = existing_hours[-1]
-                statistics.append(StatisticData(start=last_hour, state=value, sum=running_sum, last_reset=last_hour))
-            else:
-                statistics.append(StatisticData(start=start, state=value, sum=running_sum, last_reset=start))
+        daily_statistics, running_sum = self._build_daily_statistics(
+            daily_entries, existing_hours_by_day, local_tz, running_sum
+        )
+        statistics.extend(daily_statistics)
 
         if not statistics:
             _LOGGER.warning("Daily history backfill: no convertible usage values found")
@@ -525,9 +601,22 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         """
         session = self._create_authenticated_session()
         local_tz = boundary_local.tzinfo
+        monthly_totals = self._fetch_monthly_totals_before(session, boundary_month_start, local_tz)
+        daily_entries = self._fetch_daily_totals_from(session, boundary_month_start, local_tz)
+        return monthly_totals, daily_entries
 
+    def _fetch_monthly_totals_before(self, session, boundary_month_start: datetime, local_tz) -> list:
+        """Walk back through zoom=year pages, collecting entries strictly before boundary_month_start.
+
+        Anchors the walk-back at boundary_month_start, not "now": months
+        on/after the boundary are never wanted from this endpoint (the
+        daily window covers them instead), so starting from "now" would
+        just fetch and fully discard a page whenever the cutover date is
+        more than ~1 page (~400 days) old. The per-entry filter below stays
+        as a defensive backstop.
+        """
         monthly_totals = []
-        end_ms = int(datetime.now(local_tz).timestamp() * 1000)
+        end_ms = int(boundary_month_start.timestamp() * 1000)
         for _ in range(60):  # safety cap; Sensus currently retains ~24 months
             page = self._fetch_yearly_page(session, end_ms)
             if not page:
@@ -541,17 +630,46 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             if not has_prev or page_start_ms is None:
                 break
             end_ms = page_start_ms - 1
-
         monthly_totals.sort(key=lambda row: row[0])
+        return monthly_totals
+
+    def _fetch_daily_totals_from(self, session, boundary_month_start: datetime, local_tz) -> list:
+        """Fetch real daily entries from boundary_month_start through today.
+
+        Requests a range wide enough to actually reach boundary_month_start,
+        not a fixed 60 days - a cutover date older than 60 days used to
+        leave a silent gap between the monthly totals and this daily
+        window. Sensus's daily-granularity retention may itself be capped
+        below what we ask for; detect and warn rather than assume the
+        request is honored.
+        """
+        now_local = datetime.now(local_tz)
+        daily_start_local = min(boundary_month_start, now_local - timedelta(days=60))
+        raw_entries = self._fetch_daily_entries_in_range(session, daily_start_local, now_local)
+        self._warn_if_daily_data_falls_short(raw_entries, boundary_month_start, local_tz)
 
         daily_entries = []
-        for ts_ms, usage, usage_unit in self._fetch_recent_daily_window(session):
+        for ts_ms, usage, usage_unit in raw_entries:
             entry_time = dt_util.utc_from_timestamp(ts_ms / 1000).astimezone(local_tz)
             if entry_time >= boundary_month_start:
                 daily_entries.append((dt_util.as_utc(entry_time), usage, usage_unit))
         daily_entries.sort(key=lambda row: row[0])
+        return daily_entries
 
-        return monthly_totals, daily_entries
+    @staticmethod
+    def _warn_if_daily_data_falls_short(raw_entries, boundary_month_start: datetime, local_tz) -> None:
+        """Log a warning if Sensus's daily-granularity data doesn't actually reach the boundary."""
+        if not raw_entries:
+            return
+        earliest_dt = dt_util.utc_from_timestamp(min(entry[0] for entry in raw_entries) / 1000).astimezone(local_tz)
+        if earliest_dt > boundary_month_start:
+            _LOGGER.warning(
+                "Daily history backfill: requested daily data back to %s, but Sensus only "
+                "returned daily-granularity data starting %s - days in between will have no "
+                "statistics from this backfill (likely a server-side Sensus retention limit).",
+                boundary_month_start.date(),
+                earliest_dt.date(),
+            )
 
     def _fetch_yearly_page(self, session, end_ms: int):
         """Fetch one zoom=year page ending at ``end_ms``.
@@ -586,14 +704,12 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         entries = [(row[0], row[1], usage_unit) for row in usage_list[1:]]
         return entries, bool(payload.get("hasPrev")), payload.get("start")
 
-    def _fetch_recent_daily_window(self, session):
-        """Fetch the recent rolling daily-granularity window (zoom=month)."""
+    def _fetch_daily_entries_in_range(self, session, start_local: datetime, end_local: datetime):
+        """Fetch daily-granularity entries (zoom=month) for an explicit local-time range."""
         usage_url = urljoin(self.base_url, f"water/usage/{self.account_number}/{self.meter_number}")
-        local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
-        now_local = datetime.now(local_tz)
         params = {
-            "start": int((now_local - timedelta(days=60)).timestamp() * 1000),
-            "end": int(now_local.timestamp() * 1000),
+            "start": int(start_local.timestamp() * 1000),
+            "end": int(end_local.timestamp() * 1000),
             "zoom": "month",
             "page": "null",
             "weather": "1",
@@ -603,7 +719,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             response.raise_for_status()
             data = response.json()
         except requests.exceptions.RequestException as e:
-            _LOGGER.error("Recent daily window retrieval failed: %s", e)
+            _LOGGER.error("Daily window retrieval failed: %s", e)
             return []
 
         if not data.get("operationSuccess", False):
