@@ -270,25 +270,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Hourly backfill: no convertible usage values found")
             return 0
 
-        metadata = StatisticMetaData(
-            has_sum=True,
-            name=None,
-            source="recorder",
-            statistic_id=statistic_id,
-            unit_of_measurement=unit,
-        )
-        # Populate the mean field under whichever key this HA core expects.
-        if _MEAN_NONE is not None:
-            metadata["mean_type"] = _MEAN_NONE
-        else:
-            metadata["has_mean"] = False
-        async_import_statistics(self.hass, metadata, statistics)
-        _LOGGER.info(
-            "Hourly backfill: imported %s hourly statistics rows for %s",
-            len(statistics),
-            statistic_id,
-        )
-        return len(statistics)
+        return self._import_statistics(statistic_id, unit, statistics, "Hourly backfill")
 
     def _fetch_hourly_window(self, hours: int):
         """Fetch and merge the last ``hours`` of hourly entries (runs in executor)."""
@@ -359,6 +341,46 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         """Convert a native usage value to the configured unit."""
         config_unit = self.config_entry.data.get("unit_type")
         return convert_usage_value(usage, usage_unit, config_unit)
+
+    def _import_statistics(self, statistic_id: str, unit, statistics: list, log_label: str) -> int:
+        """Build metadata and import statistics rows, logging the result.
+
+        Shared by all three statistics-writing entry points (hourly
+        backfill, daily backfill, and the recurring daily refresh).
+        """
+        metadata = StatisticMetaData(
+            has_sum=True,
+            name=None,
+            source="recorder",
+            statistic_id=statistic_id,
+            unit_of_measurement=unit,
+        )
+        # Populate the mean field under whichever key this HA core expects.
+        if _MEAN_NONE is not None:
+            metadata["mean_type"] = _MEAN_NONE
+        else:
+            metadata["has_mean"] = False
+        async_import_statistics(self.hass, metadata, statistics)
+        _LOGGER.info("%s: imported %s statistics row(s) for %s", log_label, len(statistics), statistic_id)
+        return len(statistics)
+
+    def _build_monthly_statistics(self, monthly_totals, starting_sum=0.0):
+        """Build StatisticData rows for pre-aggregated monthly totals.
+
+        Monthly rows are always a true historical gap - no existing hourly
+        data can exist that far back - so a single row per month is
+        sufficient (unlike daily entries, which may need existing hours
+        flattened; see _build_daily_statistics).
+        """
+        statistics = []
+        running_sum = starting_sum
+        for start, usage, usage_unit in monthly_totals:
+            value = self._convert_usage_value(usage, usage_unit)
+            if value is None:
+                continue
+            running_sum += value
+            statistics.append(StatisticData(start=start, state=value, sum=running_sum, last_reset=start))
+        return statistics, running_sum
 
     def _build_daily_statistics(self, daily_entries, existing_hours_by_day, local_tz, starting_sum=0.0):
         """Build StatisticData rows for daily entries, overwriting any existing
@@ -441,24 +463,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         if not statistics:
             return 0
 
-        metadata = StatisticMetaData(
-            has_sum=True,
-            name=None,
-            source="recorder",
-            statistic_id=statistic_id,
-            unit_of_measurement=unit,
-        )
-        if _MEAN_NONE is not None:
-            metadata["mean_type"] = _MEAN_NONE
-        else:
-            metadata["has_mean"] = False
-        async_import_statistics(self.hass, metadata, statistics)
-        _LOGGER.info(
-            "Scheduled daily refresh: imported %s statistics row(s) for %s",
-            len(statistics),
-            statistic_id,
-        )
-        return len(statistics)
+        return self._import_statistics(statistic_id, unit, statistics, "Scheduled daily refresh")
 
     def _fetch_daily_entries_for_refresh(self, start_local: datetime, end_local: datetime):
         """Fetch daily entries for the scheduled refresh window (runs in executor)."""
@@ -520,45 +525,17 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         # what we write to the day's first/midnight hour.
         existing_hours_by_day = await self._get_existing_hours_by_day(statistic_id, boundary_month_start, local_tz)
 
-        statistics = []
-        running_sum = 0.0
-
-        # Monthly rows are always a true historical gap - no existing hourly data
-        # can exist that far back - so a single row per month is sufficient.
-        for start, usage, usage_unit in monthly_totals:
-            value = self._convert_usage_value(usage, usage_unit)
-            if value is None:
-                continue
-            running_sum += value
-            statistics.append(StatisticData(start=start, state=value, sum=running_sum, last_reset=start))
-
+        monthly_statistics, running_sum = self._build_monthly_statistics(monthly_totals)
         daily_statistics, running_sum = self._build_daily_statistics(
             daily_entries, existing_hours_by_day, local_tz, running_sum
         )
-        statistics.extend(daily_statistics)
+        statistics = monthly_statistics + daily_statistics
 
         if not statistics:
             _LOGGER.warning("Daily history backfill: no convertible usage values found")
             return 0
 
-        metadata = StatisticMetaData(
-            has_sum=True,
-            name=None,
-            source="recorder",
-            statistic_id=statistic_id,
-            unit_of_measurement=unit,
-        )
-        if _MEAN_NONE is not None:
-            metadata["mean_type"] = _MEAN_NONE
-        else:
-            metadata["has_mean"] = False
-        async_import_statistics(self.hass, metadata, statistics)
-        _LOGGER.info(
-            "Daily history backfill: imported %s statistics row(s) for %s",
-            len(statistics),
-            statistic_id,
-        )
-        return len(statistics)
+        return self._import_statistics(statistic_id, unit, statistics, "Daily history backfill")
 
     async def _get_existing_hours_by_day(self, statistic_id: str, start_time: datetime, local_tz) -> dict:
         """Return existing statistics hour start-datetimes, grouped by local calendar date."""
