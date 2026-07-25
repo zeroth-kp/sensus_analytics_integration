@@ -169,9 +169,7 @@ class SensusAnalyticsOptionsFlow(config_entries.OptionsFlow):
                 ): cv.positive_float,
                 vol.Optional(
                     CONF_HOUR_SETTLE_DELAY_MINUTES,
-                    default=current_data.get(
-                        CONF_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_HOUR_SETTLE_DELAY_MINUTES
-                    ),
+                    default=current_data.get(CONF_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_HOUR_SETTLE_DELAY_MINUTES),
                 ): cv.positive_int,
             }
         )

@@ -429,9 +429,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         # existing hours overwritten, or the day view keeps reading the old
         # (uncorrected) value from whatever hour happens to be last, regardless of
         # what we write to the day's first/midnight hour.
-        existing_hours_by_day = await self._get_existing_hours_by_day(
-            statistic_id, boundary_month_start, local_tz
-        )
+        existing_hours_by_day = await self._get_existing_hours_by_day(statistic_id, boundary_month_start, local_tz)
 
         statistics = []
         running_sum = 0.0
@@ -443,9 +441,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             if value is None:
                 continue
             running_sum += value
-            statistics.append(
-                StatisticData(start=start, state=value, sum=running_sum, last_reset=start)
-            )
+            statistics.append(StatisticData(start=start, state=value, sum=running_sum, last_reset=start))
 
         for start, usage, usage_unit in daily_entries:
             value = self._convert_usage_value(usage, usage_unit)
@@ -459,17 +455,11 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
                 # change), then land the day's full corrected total on the last
                 # one - that's the row HA's day/month views actually read.
                 for hour in existing_hours[:-1]:
-                    statistics.append(
-                        StatisticData(start=hour, state=0, sum=day_start_sum, last_reset=hour)
-                    )
+                    statistics.append(StatisticData(start=hour, state=0, sum=day_start_sum, last_reset=hour))
                 last_hour = existing_hours[-1]
-                statistics.append(
-                    StatisticData(start=last_hour, state=value, sum=running_sum, last_reset=last_hour)
-                )
+                statistics.append(StatisticData(start=last_hour, state=value, sum=running_sum, last_reset=last_hour))
             else:
-                statistics.append(
-                    StatisticData(start=start, state=value, sum=running_sum, last_reset=start)
-                )
+                statistics.append(StatisticData(start=start, state=value, sum=running_sum, last_reset=start))
 
         if not statistics:
             _LOGGER.warning("Daily history backfill: no convertible usage values found")
