@@ -1,0 +1,77 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Weekly, Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/zestysoft/sensus_analytics_integration.git
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip if an unresolved sync PR is already open
+        if: steps.check.outputs.up_to_date == 'false'
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          open_count=$(gh pr list --search "label:upstream-sync state:open" --json number --jq 'length')
+          echo "has_open=$([ "$open_count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Create sync branch and merge upstream
+        if: steps.check.outputs.up_to_date == 'false' && steps.existing.outputs.has_open == 'false'
+        id: merge
+        run: |
+          branch="sync-upstream-$(date +%Y%m%d)"
+          git checkout -b "$branch"
+          if git merge upstream/main --no-edit; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git add -A
+            git commit -m "Merge upstream/main (has conflicts - resolve manually)" --no-verify
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+          git push origin "$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Open PR
+        if: steps.check.outputs.up_to_date == 'false' && steps.existing.outputs.has_open == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.merge.outputs.conflict }}" = "true" ]; then
+            title="Sync upstream changes (conflicts need manual resolution)"
+            body="New commits from zestysoft/sensus_analytics_integration, merged into this branch. The merge has conflicts - resolve them locally before merging this PR."
+          else
+            title="Sync upstream changes"
+            body="New commits from zestysoft/sensus_analytics_integration, merged cleanly. Review before merging."
+          fi
+          gh pr create --title "$title" --body "$body" --base main --head "${{ steps.merge.outputs.branch }}" --label upstream-sync
