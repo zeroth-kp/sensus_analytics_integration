@@ -18,6 +18,15 @@ backfill_hourly_statistics:
           step: 1
           unit_of_measurement: hours
           mode: box
+    config_entry_id:
+      name: Account
+      description: >-
+        Optional: limit this backfill to a single Sensus Analytics account
+        (config entry). If omitted, applies to all configured accounts.
+      required: false
+      selector:
+        config_entry:
+          integration: sensus_analytics
 
 backfill_daily_history:
   name: Backfill daily history
@@ -40,3 +49,12 @@ backfill_daily_history:
       example: "2026-07-05"
       selector:
         date: {}
+    config_entry_id:
+      name: Account
+      description: >-
+        Optional: limit this backfill to a single Sensus Analytics account
+        (config entry). If omitted, applies to all configured accounts.
+      required: false
+      selector:
+        config_entry:
+          integration: sensus_analytics
