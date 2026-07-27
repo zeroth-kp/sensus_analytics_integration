@@ -1,7 +1,7 @@
 """DataUpdateCoordinator for Sensus Analytics Integration."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from urllib.parse import urljoin
 
 import requests
@@ -382,6 +382,11 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             statistics.append(StatisticData(start=start, state=value, sum=running_sum, last_reset=start))
         return statistics, running_sum
 
+    # The fixed hour every day's corrected total lands on - see the
+    # docstring below for why this replaced "whichever hour already
+    # existed".
+    _DAILY_CANONICAL_HOUR = time(23, 0)
+
     def _build_daily_statistics(self, daily_entries, existing_hours_by_day, local_tz, starting_sum=0.0):
         """Build StatisticData rows for daily entries, overwriting any existing
         hourly rows for days that already have real hourly history.
@@ -393,6 +398,17 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         or the day view keeps reading the old (uncorrected) value from
         whatever hour happens to be last, regardless of what's written to
         the day's first/midnight hour.
+
+        Every day's total lands on a FIXED canonical hour (23:00 local),
+        not "whichever hour happens to already exist" - the latter made
+        repeat calls non-idempotent: if a call landed a day's total on a
+        newly-created hour, a second call moments later would see that hour
+        as "existing" and re-derive/overwrite it from a fresh (and
+        possibly different) baseline, producing a phantom spike-then-revert
+        pair when the two calls' views of the day disagreed. Landing on a
+        fixed hour every time means re-running this (with the same or
+        overlapping inputs) converges on the same absolute sums instead of
+        drifting.
 
         Shared by the one-time cutover backfill and the recurring scheduled
         refresh (see async_backfill_daily_history and
@@ -406,17 +422,15 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
                 continue
             day_start_sum = running_sum
             running_sum += value
-            existing_hours = existing_hours_by_day.get(start.astimezone(local_tz).date())
-            if existing_hours:
-                # Flatten every existing hour except the last (no incremental
-                # change), then land the day's full corrected total on the last
-                # one - that's the row HA's day/month views actually read.
-                for hour in existing_hours[:-1]:
-                    statistics.append(StatisticData(start=hour, state=0, sum=day_start_sum, last_reset=hour))
-                last_hour = existing_hours[-1]
-                statistics.append(StatisticData(start=last_hour, state=value, sum=running_sum, last_reset=last_hour))
-            else:
-                statistics.append(StatisticData(start=start, state=value, sum=running_sum, last_reset=start))
+            day_date = start.astimezone(local_tz).date()
+            canonical_hour = dt_util.as_utc(datetime.combine(day_date, self._DAILY_CANONICAL_HOUR, tzinfo=local_tz))
+            for hour in existing_hours_by_day.get(day_date, []):
+                if hour == canonical_hour:
+                    continue
+                statistics.append(StatisticData(start=hour, state=0, sum=day_start_sum, last_reset=hour))
+            statistics.append(
+                StatisticData(start=canonical_hour, state=value, sum=running_sum, last_reset=canonical_hour)
+            )
         return statistics, running_sum
 
     # ------------------------------------------------------------------
