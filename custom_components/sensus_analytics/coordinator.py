@@ -317,6 +317,14 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         same-day data instead of several days), leaving the 1-hour
         lookback nothing to anchor to.
         """
+        existing = await self._get_existing_sum_before(statistic_id, window_start)
+        return existing if existing is not None else 0.0
+
+    async def _get_existing_sum_before(self, statistic_id: str, window_start: datetime):
+        """Return the cumulative sum of the most recent hour before the window,
+        or None if no statistics exist there at all (as opposed to legitimately
+        being 0.0) - see _get_baseline_sum for the 7-day lookback rationale.
+        """
         stats = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
@@ -330,7 +338,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         rows = stats.get(statistic_id) if stats else None
         if rows:
             return rows[-1].get("sum") or 0.0
-        return 0.0
+        return None
 
     @staticmethod
     def _floor_to_hour_utc(timestamp_ms: int) -> datetime:
@@ -539,9 +547,26 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         # what we write to the day's first/midnight hour.
         existing_hours_by_day = await self._get_existing_hours_by_day(statistic_id, boundary_month_start, local_tz)
 
-        monthly_statistics, running_sum = self._build_monthly_statistics(monthly_totals)
+        monthly_statistics, monthly_running_sum = self._build_monthly_statistics(monthly_totals)
+        daily_starting_sum = monthly_running_sum
+
+        # Sensus's own daily-granularity retention can fall short of
+        # boundary_month_start (see _warn_if_daily_data_falls_short), leaving a
+        # gap between the monthly-aggregate total and the first real daily
+        # entry. If statistics already exist spanning that gap - true for
+        # every re-run except the very first cutover backfill - resetting the
+        # running sum to the monthly-aggregate total silently discards
+        # whatever was already recorded for the gap and creates a downward
+        # discontinuity in every day from there forward. Bridge from the
+        # existing recorded sum instead, so a re-run can never regress
+        # history it can no longer independently re-derive.
+        if daily_entries and daily_entries[0][0] > boundary_month_start:
+            existing_sum = await self._get_existing_sum_before(statistic_id, daily_entries[0][0])
+            if existing_sum is not None:
+                daily_starting_sum = existing_sum
+
         daily_statistics, running_sum = self._build_daily_statistics(
-            daily_entries, existing_hours_by_day, local_tz, running_sum
+            daily_entries, existing_hours_by_day, local_tz, daily_starting_sum
         )
         statistics = monthly_statistics + daily_statistics
 
