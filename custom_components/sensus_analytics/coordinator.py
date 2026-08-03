@@ -350,11 +350,24 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         config_unit = self.config_entry.data.get("unit_type")
         return convert_usage_value(usage, usage_unit, config_unit)
 
-    def _import_statistics(self, statistic_id: str, unit, statistics: list, log_label: str) -> int:
+    def _import_statistics(
+        self, statistic_id: str, unit, statistics: list, log_label: str, *, level: int = logging.INFO
+    ) -> int:
         """Build metadata and import statistics rows, logging the result.
 
         Shared by all three statistics-writing entry points (hourly
         backfill, daily backfill, and the recurring daily refresh).
+
+        ``level`` defaults to INFO for the two high-frequency callers
+        (hourly backfill runs every hour, the scheduled refresh every
+        24h - logging those at WARNING by default would just be noise).
+        ``async_backfill_daily_history`` overrides this to WARNING: it's
+        rare, operator-invoked, and reprocesses every day from its
+        cutover through today in one call (lesson #29) - the highest
+        blast-radius write this integration makes, and previously
+        left the only trace of a successful (or corrupting) run at
+        INFO, invisible at this integration's default WARNING log
+        level. A completed run of *that* call should always be visible.
         """
         metadata = StatisticMetaData(
             has_sum=True,
@@ -369,7 +382,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         else:
             metadata["has_mean"] = False
         async_import_statistics(self.hass, metadata, statistics)
-        _LOGGER.info("%s: imported %s statistics row(s) for %s", log_label, len(statistics), statistic_id)
+        _LOGGER.log(level, "%s: imported %s statistics row(s) for %s", log_label, len(statistics), statistic_id)
         return len(statistics)
 
     def _build_monthly_statistics(self, monthly_totals, starting_sum=0.0):
@@ -574,7 +587,9 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Daily history backfill: no convertible usage values found")
             return 0
 
-        return self._import_statistics(statistic_id, unit, statistics, "Daily history backfill")
+        return self._import_statistics(
+            statistic_id, unit, statistics, "Daily history backfill", level=logging.WARNING
+        )
 
     async def _get_existing_hours_by_day(self, statistic_id: str, start_time: datetime, local_tz) -> dict:
         """Return existing statistics hour start-datetimes, grouped by local calendar date."""
