@@ -587,9 +587,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Daily history backfill: no convertible usage values found")
             return 0
 
-        return self._import_statistics(
-            statistic_id, unit, statistics, "Daily history backfill", level=logging.WARNING
-        )
+        return self._import_statistics(statistic_id, unit, statistics, "Daily history backfill", level=logging.WARNING)
 
     async def _get_existing_hours_by_day(self, statistic_id: str, start_time: datetime, local_tz) -> dict:
         """Return existing statistics hour start-datetimes, grouped by local calendar date."""
