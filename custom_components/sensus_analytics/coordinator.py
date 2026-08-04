@@ -408,6 +408,25 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
     # existed".
     _DAILY_CANONICAL_HOUR = time(23, 0)
 
+    # Ceiling on a single day's usage, in gallons, above which a daily entry
+    # is treated as implausible rather than imported. Sensus's pre-aggregated
+    # monthly-total endpoint and its real daily-granularity endpoint can
+    # disagree at a month boundary; in the worst case a full month's total
+    # can end up misattributed to a single day, producing a one-day value
+    # many times larger than any real residential meter would show. This
+    # ceiling sits comfortably above the highest plausible single-day
+    # reading for a household (including heavy irrigation use) while still
+    # catching a misattributed monthly total, so a boundary disagreement is
+    # skipped and logged loudly instead of silently corrupting the
+    # cumulative sum chain.
+    _MAX_PLAUSIBLE_DAILY_USAGE_GAL = 15000
+
+    def _max_plausible_daily_value(self) -> float:
+        """Return the sanity ceiling in the sensor's configured unit."""
+        config_unit = self.config_entry.data.get("unit_type")
+        converted = convert_usage_value(self._MAX_PLAUSIBLE_DAILY_USAGE_GAL, "GAL", config_unit)
+        return converted if converted is not None else self._MAX_PLAUSIBLE_DAILY_USAGE_GAL
+
     def _build_daily_statistics(self, daily_entries, existing_hours_by_day, local_tz, starting_sum=0.0):
         """Build StatisticData rows for daily entries, overwriting any existing
         hourly rows for days that already have real hourly history.
@@ -431,19 +450,38 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         overlapping inputs) converges on the same absolute sums instead of
         drifting.
 
+        A day whose value exceeds _MAX_PLAUSIBLE_DAILY_USAGE_GAL is skipped
+        entirely (no rows written, running_sum left untouched) rather than
+        imported - see that constant's docstring for why. This is a
+        last-line-of-defense guard against one specific failure mode, not a
+        substitute for reconciling the two endpoints properly.
+
         Shared by the one-time cutover backfill and the recurring scheduled
         refresh (see async_backfill_daily_history and
         async_refresh_recent_daily_statistics).
         """
         statistics = []
         running_sum = starting_sum
+        ceiling = self._max_plausible_daily_value()
         for start, usage, usage_unit in daily_entries:
             value = self._convert_usage_value(usage, usage_unit)
             if value is None:
                 continue
+            day_date = start.astimezone(local_tz).date()
+            if value > ceiling:
+                _LOGGER.error(
+                    "Daily usage for %s (%s %s) exceeds the plausibility ceiling (%s %s) - "
+                    "treating as implausible and skipping rather than importing it. "
+                    "Check the source portal directly for this day's real figure.",
+                    day_date,
+                    value,
+                    self.config_entry.data.get("unit_type"),
+                    ceiling,
+                    self.config_entry.data.get("unit_type"),
+                )
+                continue
             day_start_sum = running_sum
             running_sum += value
-            day_date = start.astimezone(local_tz).date()
             canonical_hour = dt_util.as_utc(datetime.combine(day_date, self._DAILY_CANONICAL_HOUR, tzinfo=local_tz))
             for hour in existing_hours_by_day.get(day_date, []):
                 if hour == canonical_hour:
