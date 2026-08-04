@@ -217,3 +217,79 @@ async def test_async_backfill_daily_history_end_to_end(recorder_mock, enable_cus
         imported = await coordinator.async_backfill_daily_history(datetime(2026, 6, 1).date())
 
     assert imported >= 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_bridges_existing_sum_across_a_retention_gap(recorder_mock, enable_custom_integrations, hass):
+    """A re-run whose cutover month Sensus can no longer fully re-derive (its
+    daily-granularity retention starts later than the cutover month, as
+    make_mock_session's fixed 2026-07-20 DAILY_RESPONSE does relative to a
+    2026-06-01 cutover) must not discard the already-recorded sum for the
+    gap - it should bridge from what's already there instead of resetting to
+    the monthly-aggregate-only baseline (which would create a downward
+    discontinuity, undercounting everything from the gap forward).
+
+    Builds the coordinator directly rather than through
+    hass.config_entries.async_setup, so the platform's automatic
+    startup-triggered scheduled refresh (which runs against real wall-clock
+    "now", not this test's fixed 2026 dates) can't interfere with the
+    controlled scenario below.
+    """
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.models import StatisticData
+    from homeassistant.components.recorder.statistics import statistics_during_period
+
+    coordinator = SensusAnalyticsDataUpdateCoordinator.__new__(SensusAnalyticsDataUpdateCoordinator)
+    coordinator.hass = hass
+    coordinator.base_url = "https://example.invalid/"
+    coordinator.username = "user"
+    coordinator.password = "pass"
+    coordinator.account_number = "acct"
+    coordinator.meter_number = "meter"
+    coordinator.config_entry = SimpleNamespace(entry_id="test_entry", data=config_entry_data())
+    # No entity registered under this unique_id, so _resolve_daily_usage_statistic_id
+    # falls back to this fixed statistic_id.
+    statistic_id = "sensor.sensus_analytics_daily_usage"
+
+    # Seed a pre-existing statistic inside the gap (between the 2026-06-01
+    # cutover and make_mock_session's fixed 2026-07-20 daily entry) with a
+    # large sum, simulating an entity that's already been accumulating real
+    # history there - exactly the case where Sensus's retention has since
+    # moved past what a fresh backfill call can independently re-derive.
+    existing_sum = 500000.0
+    # Within the 7-day lookback _get_existing_sum_before uses ahead of the
+    # first real daily entry (2026-07-20 per DAILY_RESPONSE).
+    pre_existing_hour = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+    coordinator._import_statistics(
+        statistic_id,
+        "CCF",
+        [StatisticData(start=pre_existing_hour, state=0, sum=existing_sum, last_reset=pre_existing_hour)],
+        "test seed",
+    )
+    await hass.async_block_till_done()
+    await get_instance(hass).async_block_till_done()
+
+    with patch(
+        "custom_components.sensus_analytics.coordinator.requests.Session",
+        return_value=make_mock_session(),
+    ):
+        await coordinator.async_backfill_daily_history(datetime(2026, 6, 1).date())
+    await hass.async_block_till_done()
+    await get_instance(hass).async_block_till_done()
+
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        datetime(2026, 7, 19, tzinfo=timezone.utc),
+        None,
+        {statistic_id},
+        "hour",
+        None,
+        {"sum"},
+    )
+    rows = stats[statistic_id]
+    # DAILY_RESPONSE contributes a single +2 CCF entry on top of whatever the
+    # backfill bridged from - bridging from existing_sum (not the ~30 CCF
+    # monthly-aggregate-only baseline) is what proves the gap didn't regress
+    # the already-recorded total.
+    assert rows[-1]["sum"] == pytest.approx(existing_sum + 2)
