@@ -317,6 +317,14 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         same-day data instead of several days), leaving the 1-hour
         lookback nothing to anchor to.
         """
+        existing = await self._get_existing_sum_before(statistic_id, window_start)
+        return existing if existing is not None else 0.0
+
+    async def _get_existing_sum_before(self, statistic_id: str, window_start: datetime):
+        """Return the cumulative sum of the most recent hour before the window,
+        or None if no statistics exist there at all (as opposed to legitimately
+        being 0.0) - see _get_baseline_sum for the 7-day lookback rationale.
+        """
         stats = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
@@ -330,7 +338,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         rows = stats.get(statistic_id) if stats else None
         if rows:
             return rows[-1].get("sum") or 0.0
-        return 0.0
+        return None
 
     @staticmethod
     def _floor_to_hour_utc(timestamp_ms: int) -> datetime:
@@ -342,11 +350,24 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         config_unit = self.config_entry.data.get("unit_type")
         return convert_usage_value(usage, usage_unit, config_unit)
 
-    def _import_statistics(self, statistic_id: str, unit, statistics: list, log_label: str) -> int:
+    def _import_statistics(
+        self, statistic_id: str, unit, statistics: list, log_label: str, *, level: int = logging.INFO
+    ) -> int:
         """Build metadata and import statistics rows, logging the result.
 
         Shared by all three statistics-writing entry points (hourly
         backfill, daily backfill, and the recurring daily refresh).
+
+        ``level`` defaults to INFO for the two high-frequency callers
+        (hourly backfill runs every hour, the scheduled refresh every
+        24h - logging those at WARNING by default would just be noise).
+        ``async_backfill_daily_history`` overrides this to WARNING: it's
+        rare, operator-invoked, and reprocesses every day from its
+        cutover through today in one call (lesson #29) - the highest
+        blast-radius write this integration makes, and previously
+        left the only trace of a successful (or corrupting) run at
+        INFO, invisible at this integration's default WARNING log
+        level. A completed run of *that* call should always be visible.
         """
         metadata = StatisticMetaData(
             has_sum=True,
@@ -361,7 +382,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         else:
             metadata["has_mean"] = False
         async_import_statistics(self.hass, metadata, statistics)
-        _LOGGER.info("%s: imported %s statistics row(s) for %s", log_label, len(statistics), statistic_id)
+        _LOGGER.log(level, "%s: imported %s statistics row(s) for %s", log_label, len(statistics), statistic_id)
         return len(statistics)
 
     def _build_monthly_statistics(self, monthly_totals, starting_sum=0.0):
@@ -539,9 +560,26 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         # what we write to the day's first/midnight hour.
         existing_hours_by_day = await self._get_existing_hours_by_day(statistic_id, boundary_month_start, local_tz)
 
-        monthly_statistics, running_sum = self._build_monthly_statistics(monthly_totals)
+        monthly_statistics, monthly_running_sum = self._build_monthly_statistics(monthly_totals)
+        daily_starting_sum = monthly_running_sum
+
+        # Sensus's own daily-granularity retention can fall short of
+        # boundary_month_start (see _warn_if_daily_data_falls_short), leaving a
+        # gap between the monthly-aggregate total and the first real daily
+        # entry. If statistics already exist spanning that gap - true for
+        # every re-run except the very first cutover backfill - resetting the
+        # running sum to the monthly-aggregate total silently discards
+        # whatever was already recorded for the gap and creates a downward
+        # discontinuity in every day from there forward. Bridge from the
+        # existing recorded sum instead, so a re-run can never regress
+        # history it can no longer independently re-derive.
+        if daily_entries and daily_entries[0][0] > boundary_month_start:
+            existing_sum = await self._get_existing_sum_before(statistic_id, daily_entries[0][0])
+            if existing_sum is not None:
+                daily_starting_sum = existing_sum
+
         daily_statistics, running_sum = self._build_daily_statistics(
-            daily_entries, existing_hours_by_day, local_tz, running_sum
+            daily_entries, existing_hours_by_day, local_tz, daily_starting_sum
         )
         statistics = monthly_statistics + daily_statistics
 
@@ -549,7 +587,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Daily history backfill: no convertible usage values found")
             return 0
 
-        return self._import_statistics(statistic_id, unit, statistics, "Daily history backfill")
+        return self._import_statistics(statistic_id, unit, statistics, "Daily history backfill", level=logging.WARNING)
 
     async def _get_existing_hours_by_day(self, statistic_id: str, start_time: datetime, local_tz) -> dict:
         """Return existing statistics hour start-datetimes, grouped by local calendar date."""
