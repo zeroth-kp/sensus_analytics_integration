@@ -480,7 +480,9 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         converted = convert_usage_value(self._MAX_PLAUSIBLE_DAILY_USAGE_GAL, "GAL", config_unit)
         return converted if converted is not None else self._MAX_PLAUSIBLE_DAILY_USAGE_GAL
 
-    def _build_daily_statistics(self, daily_entries, existing_hours_by_day, local_tz, starting_sum=0.0):
+    def _build_daily_statistics(  # pylint: disable=too-many-locals
+        self, daily_entries, existing_hours_by_day, local_tz, starting_sum=0.0
+    ):
         """Build StatisticData rows for daily entries, overwriting any existing
         hourly rows for days that already have real hourly history.
 
@@ -626,7 +628,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
     # the live entity's ongoing data.
     # ------------------------------------------------------------------
 
-    async def async_backfill_daily_history(self, cutover_date) -> int:
+    async def async_backfill_daily_history(self, cutover_date) -> int:  # pylint: disable=too-many-locals
         """Backfill sensor.*_daily_usage's long-term statistics before ``cutover_date``.
 
         ``cutover_date`` only controls where the monthly-aggregate backfill
@@ -677,7 +679,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             if existing_sum is not None:
                 daily_starting_sum = existing_sum
 
-        daily_statistics, running_sum = self._build_daily_statistics(
+        daily_statistics, _ = self._build_daily_statistics(
             daily_entries, existing_hours_by_day, local_tz, daily_starting_sum
         )
         statistics = monthly_statistics + daily_statistics
