@@ -1,6 +1,7 @@
 """DataUpdateCoordinator for Sensus Analytics Integration."""
 
 import logging
+import math
 from datetime import datetime, time, timedelta
 from urllib.parse import urljoin
 
@@ -270,6 +271,11 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Hourly backfill: no convertible usage values found")
             return 0
 
+        if not await self._verify_baseline_unchanged(
+            statistic_id, first_start, baseline_sum, log_label="Hourly backfill"
+        ):
+            return 0
+
         return self._import_statistics(statistic_id, unit, statistics, "Hourly backfill")
 
     def _fetch_hourly_window(self, hours: int):
@@ -339,6 +345,53 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         if rows:
             return rows[-1].get("sum") or 0.0
         return None
+
+    async def _verify_baseline_unchanged(
+        self, statistic_id: str, anchor: datetime, expected_sum, *, log_label: str
+    ) -> bool:
+        """Re-read the sum anchor immediately before writing and confirm nothing
+        else has written to this statistic since the baseline was first read.
+
+        Every write path in this module reads a baseline sum, then spends real
+        wall-clock time (an HTTP fetch, sometimes a multi-page one) building the
+        rows to import before finally writing them - a classic check-then-act
+        race. If a different write lands on the same statistic in that gap (a
+        concurrent service call, another automation, a manual
+        ``recorder/adjust_sum_statistics`` correction), the in-flight write has
+        no way to know and simply overwrites it using its now-stale baseline,
+        silently discarding whatever the other write just committed.
+
+        Best-effort, not a true compare-and-swap: ``async_import_statistics``
+        only enqueues a job on the recorder's own queue rather than writing
+        synchronously, so a write that landed moments ago may not be visible
+        yet even to this re-read. This narrows the race window from "the
+        entire fetch+build phase" down to "the gap between this check and the
+        subsequent write," which is enough to catch the incident this guards
+        against - independent operations are realistically minutes apart, not
+        microseconds - but does not eliminate the race at the database level.
+
+        ``expected_sum`` may be ``None`` or already coerced to ``0.0`` by a
+        caller upstream (``_get_baseline_sum`` does this) - both mean "found
+        nothing at the anchor," so both sides are coerced the same way here
+        before comparing. Re-reading and finding a real nonzero value where
+        there was none before is just as much a race as two disagreeing
+        non-zero sums.
+        """
+        current_sum = await self._get_existing_sum_before(statistic_id, anchor)
+        if math.isclose(current_sum or 0.0, expected_sum or 0.0, abs_tol=1e-6):
+            return True
+        _LOGGER.error(
+            "%s: the cumulative sum baseline for %s changed (was %s, now %s) while this "
+            "run was in progress - another write raced this one. Aborting without "
+            "importing anything, since writing now would silently discard whatever the "
+            "other write just committed. Re-run once nothing else is updating this "
+            "statistic.",
+            log_label,
+            statistic_id,
+            expected_sum,
+            current_sum,
+        )
+        return False
 
     @staticmethod
     def _floor_to_hour_utc(timestamp_ms: int) -> datetime:
@@ -427,7 +480,9 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         converted = convert_usage_value(self._MAX_PLAUSIBLE_DAILY_USAGE_GAL, "GAL", config_unit)
         return converted if converted is not None else self._MAX_PLAUSIBLE_DAILY_USAGE_GAL
 
-    def _build_daily_statistics(self, daily_entries, existing_hours_by_day, local_tz, starting_sum=0.0):
+    def _build_daily_statistics(  # pylint: disable=too-many-locals
+        self, daily_entries, existing_hours_by_day, local_tz, starting_sum=0.0
+    ):
         """Build StatisticData rows for daily entries, overwriting any existing
         hourly rows for days that already have real hourly history.
 
@@ -530,10 +585,16 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         unit = config_unit if config_unit in ("gal", "CCF") else None
 
         existing_hours_by_day = await self._get_existing_hours_by_day(statistic_id, window_start_local, local_tz)
-        baseline_sum = await self._get_baseline_sum(statistic_id, dt_util.as_utc(window_start_local))
+        baseline_anchor = dt_util.as_utc(window_start_local)
+        baseline_sum = await self._get_baseline_sum(statistic_id, baseline_anchor)
         statistics, _ = self._build_daily_statistics(daily_entries, existing_hours_by_day, local_tz, baseline_sum)
 
         if not statistics:
+            return 0
+
+        if not await self._verify_baseline_unchanged(
+            statistic_id, baseline_anchor, baseline_sum, log_label="Scheduled daily refresh"
+        ):
             return 0
 
         return self._import_statistics(statistic_id, unit, statistics, "Scheduled daily refresh")
@@ -567,7 +628,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
     # the live entity's ongoing data.
     # ------------------------------------------------------------------
 
-    async def async_backfill_daily_history(self, cutover_date) -> int:
+    async def async_backfill_daily_history(self, cutover_date) -> int:  # pylint: disable=too-many-locals
         """Backfill sensor.*_daily_usage's long-term statistics before ``cutover_date``.
 
         ``cutover_date`` only controls where the monthly-aggregate backfill
@@ -611,18 +672,30 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         # discontinuity in every day from there forward. Bridge from the
         # existing recorded sum instead, so a re-run can never regress
         # history it can no longer independently re-derive.
+        bridge_anchor = None
         if daily_entries and daily_entries[0][0] > boundary_month_start:
-            existing_sum = await self._get_existing_sum_before(statistic_id, daily_entries[0][0])
+            bridge_anchor = daily_entries[0][0]
+            existing_sum = await self._get_existing_sum_before(statistic_id, bridge_anchor)
             if existing_sum is not None:
                 daily_starting_sum = existing_sum
 
-        daily_statistics, running_sum = self._build_daily_statistics(
+        daily_statistics, _ = self._build_daily_statistics(
             daily_entries, existing_hours_by_day, local_tz, daily_starting_sum
         )
         statistics = monthly_statistics + daily_statistics
 
         if not statistics:
             _LOGGER.warning("Daily history backfill: no convertible usage values found")
+            return 0
+
+        # Only the bridging branch above reads a live baseline from the
+        # recorder to re-verify - the monthly-aggregate starting sum used
+        # otherwise has no existing row to compare against (this is always
+        # the very first backfill for that date range), so there is nothing
+        # for a race to have clobbered yet.
+        if bridge_anchor is not None and not await self._verify_baseline_unchanged(
+            statistic_id, bridge_anchor, daily_starting_sum, log_label="Daily history backfill"
+        ):
             return 0
 
         return self._import_statistics(statistic_id, unit, statistics, "Daily history backfill", level=logging.WARNING)

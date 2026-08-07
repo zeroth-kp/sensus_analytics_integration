@@ -19,7 +19,7 @@ possible for speed; one true end-to-end test is included at the bottom.
 import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -293,3 +293,75 @@ async def test_backfill_bridges_existing_sum_across_a_retention_gap(recorder_moc
     # monthly-aggregate-only baseline) is what proves the gap didn't regress
     # the already-recorded total.
     assert rows[-1]["sum"] == pytest.approx(existing_sum + 2)
+
+
+@pytest.mark.asyncio
+async def test_backfill_aborts_when_a_write_races_the_bridging_baseline(
+    recorder_mock, enable_custom_integrations, hass, caplog
+):
+    """A second write (another concurrent backfill/refresh call, or a manual
+    recorder/adjust_sum_statistics correction) lands on the bridging anchor
+    between when this backfill first reads its baseline and when it would
+    otherwise write - it must detect the change and abort rather than
+    silently overwrite using the now-stale baseline it read at the start.
+
+    Same setup as test_backfill_bridges_existing_sum_across_a_retention_gap,
+    but _get_existing_sum_before is patched to return a *different* value on
+    its second call (the new pre-write verification) than its first (the
+    original bridging read) - simulating exactly that race.
+    """
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.models import StatisticData
+    from homeassistant.components.recorder.statistics import statistics_during_period
+
+    coordinator = SensusAnalyticsDataUpdateCoordinator.__new__(SensusAnalyticsDataUpdateCoordinator)
+    coordinator.hass = hass
+    coordinator.base_url = "https://example.invalid/"
+    coordinator.username = "user"
+    coordinator.password = "pass"
+    coordinator.account_number = "acct"
+    coordinator.meter_number = "meter"
+    coordinator.config_entry = SimpleNamespace(entry_id="test_entry", data=config_entry_data())
+    statistic_id = "sensor.sensus_analytics_daily_usage"
+
+    existing_sum = 500000.0
+    pre_existing_hour = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+    coordinator._import_statistics(
+        statistic_id,
+        "CCF",
+        [StatisticData(start=pre_existing_hour, state=0, sum=existing_sum, last_reset=pre_existing_hour)],
+        "test seed",
+    )
+    await hass.async_block_till_done()
+    await get_instance(hass).async_block_till_done()
+
+    # First call: the real bridging read (matches the seeded value). Second
+    # call: the pre-write verification, made to see a different number - as
+    # if a different write had landed on the same statistic in between.
+    coordinator._get_existing_sum_before = AsyncMock(side_effect=[existing_sum, existing_sum + 999_999.0])
+
+    with patch(
+        "custom_components.sensus_analytics.coordinator.requests.Session",
+        return_value=make_mock_session(),
+    ), caplog.at_level("ERROR"):
+        imported = await coordinator.async_backfill_daily_history(datetime(2026, 6, 1).date())
+
+    assert imported == 0
+    assert "changed" in caplog.text
+    assert statistic_id in caplog.text
+
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        datetime(2026, 7, 1, tzinfo=timezone.utc),
+        None,
+        {statistic_id},
+        "hour",
+        None,
+        {"sum"},
+    )
+    rows = stats[statistic_id]
+    # Nothing beyond the seeded row should exist - the abort must have
+    # prevented the write entirely, not just returned early after writing.
+    assert len(rows) == 1
+    assert rows[0]["sum"] == existing_sum
