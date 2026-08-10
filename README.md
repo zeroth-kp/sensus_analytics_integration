@@ -78,13 +78,27 @@ A custom Home Assistant integration to monitor your water usage from Sensus Anal
      - **Account Number**: Your Sensus Analytics account number.
      - **Meter Number**: Your water meter number.
      - **Unit Type**: Choose which unit type you want the data to be used by Home Assistant.
-     - **Tier 1 Gallons Cutoff**: Number of gallons before transitioning to tier 2 pricing.
-     - **Tier 1 Per Gallon Price**: Price per gallon (not unit or CF) at tier 1 level.
-     - **Tier 2 Gallons Cutoff**: Number of gallons before transitioning to tier 3 pricing.
-     - **Tier 2 Per Gallon Price**: Price per gallon (not unit or CF) at tier 2 level.
-     - **Tier 3 Per Gallon Price**: Price per gallon (not unit or CF) at tier 3 level.
-     - **Service Fee**: Price the water company charges just to have service.
+     - **Service Fee**: Flat monthly charge just for having service, independent of usage.
+     - **Included Gallons**: Gallons already covered by the service fee, billed at $0 (leave blank if your utility has no included allowance).
+     - **Tier 1/2/3 Gallons Cutoff**: The *absolute* cumulative monthly usage (in gallons) at which that tier ends and the next begins - not the width of the tier. If your bill's second bracket runs from just above the included allowance up to some total usage figure, that total figure is what goes in Tier 1 Gallons Cutoff (paired with Tier 1 Price below).
+     - **Tier 1/2/3/4 Price**: Price **per 1000 gallons** (matching how water bills are quoted) for that tier's bracket - not price per single gallon. Tier 4 has no gallons cutoff; it's always the unbounded top tier, applied to everything above Tier 3's cutoff. Leave a tier's price blank to stop the schedule there (its price then applies unbounded) - e.g. a simple flat-rate utility only needs Tier 1 Price set.
    - Click "**Submit**" to finalize the configuration.
+
+   Example shape for a typical four-tier residential water bill (a flat base fee that includes a starting allowance, then increasingly expensive per-1000-gallon tiers above it):
+
+   | Field | Value |
+   |---|---|
+   | Service Fee | `20.00` |
+   | Included Gallons | `2000` |
+   | Tier 1 Gallons Cutoff | `10000` |
+   | Tier 1 Price | `4.50` |
+   | Tier 2 Gallons Cutoff | `15000` |
+   | Tier 2 Price | `5.50` |
+   | Tier 3 Gallons Cutoff | `20000` |
+   | Tier 3 Price | `6.50` |
+   | Tier 4 Price | `9.50` |
+
+   Read your own utility's rate schedule off your bill or its published tariff sheet - the values above are illustrative only, not real rates.
 
 ## Sensor Entities
 

@@ -14,3 +14,8 @@ DEFAULT_HOUR_SETTLE_DELAY_MINUTES = 90
 
 CF_TO_GALLON = 7.48052
 CF_PER_CCF = 100  # 1 CCF = 100 cubic feet
+
+# Tiered billing prices are $ per this many gallons, matching how water
+# utilities quote per-1000-gallon (or per-CCF-equivalent) rates on a bill -
+# never $ per single gallon.
+GALLONS_PER_PRICING_UNIT = 1000

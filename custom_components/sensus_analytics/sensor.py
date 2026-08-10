@@ -10,6 +10,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_NAME, DOMAIN
+from .tiered_billing import calculate_tiered_cost
 from .usage_conversion import convert_usage_value
 
 
@@ -47,6 +48,25 @@ class UsageConversionMixin:
             usage_unit = self.coordinator.data.get("usageUnit")
         config_unit_type = self.coordinator.config_entry.data.get("unit_type")
         return convert_usage_value(usage, usage_unit, config_unit_type)
+
+    def _get_tier_schedule(self):
+        """Build the (free_gallons, tiers) schedule from config for calculate_tiered_cost.
+
+        ``included_gallons`` is usage already covered by the flat service
+        fee, billed at $0. Each tierN_gallons is the absolute cumulative
+        cutoff where tierN_price's bracket ends and the next tier begins;
+        leaving a cutoff unset makes that tier's price apply unbounded
+        (the classic single- or few-tier case, still supported as-is).
+        """
+        data = self.coordinator.config_entry.data
+        free_gallons = data.get("included_gallons") or 0
+        tiers = [
+            (data.get("tier1_gallons"), data.get("tier1_price")),
+            (data.get("tier2_gallons"), data.get("tier2_price")),
+            (data.get("tier3_gallons"), data.get("tier3_price")),
+            (None, data.get("tier4_price")),
+        ]
+        return free_gallons, tiers
 
     def _get_usage_unit(self):
         """Determine the unit of measurement for usage sensors."""
@@ -351,38 +371,10 @@ class SensusAnalyticsBillingCostSensor(StaticUnitSensorBase):
         return self._calculate_cost(usage_gallons)
 
     def _calculate_cost(self, usage_gallons):
-        """Calculate the billing cost based on tiers and service fee."""
-        tier1_gallons = self.coordinator.config_entry.data.get("tier1_gallons") or 0
-        tier1_price = self.coordinator.config_entry.data.get("tier1_price")
-        tier2_gallons = self.coordinator.config_entry.data.get("tier2_gallons") or 0
-        tier2_price = self.coordinator.config_entry.data.get("tier2_price") or 0
-        tier3_price = self.coordinator.config_entry.data.get("tier3_price") or 0
-        service_fee = self.coordinator.config_entry.data.get("service_fee")
-
-        cost = service_fee
-        if usage_gallons is not None:
-            if tier1_gallons == 0:
-                # No tier 1 limit, all usage is charged at tier 1 price
-                cost += usage_gallons * tier1_price
-            elif tier2_gallons == 0:
-                # No tier 2 limit, calculate for tier 1 and tier 2
-                if usage_gallons <= tier1_gallons:
-                    cost += usage_gallons * tier1_price
-                else:
-                    cost += tier1_gallons * tier1_price
-                    cost += (usage_gallons - tier1_gallons) * tier2_price
-            elif tier3_price > 0:
-                # Calculate for all three tiers
-                if usage_gallons <= tier1_gallons:
-                    cost += usage_gallons * tier1_price
-                elif usage_gallons <= tier1_gallons + tier2_gallons:
-                    cost += tier1_gallons * tier1_price
-                    cost += (usage_gallons - tier1_gallons) * tier2_price
-                else:
-                    cost += tier1_gallons * tier1_price
-                    cost += tier2_gallons * tier2_price
-                    cost += (usage_gallons - tier1_gallons - tier2_gallons) * tier3_price
-
+        """Calculate the billing cost: flat service fee plus tiered usage cost."""
+        service_fee = self.coordinator.config_entry.data.get("service_fee") or 0
+        free_gallons, tiers = self._get_tier_schedule()
+        cost = service_fee + calculate_tiered_cost(usage_gallons, tiers, free_gallons)
         return round(cost, 2)
 
 
@@ -408,37 +400,18 @@ class SensusAnalyticsDailyFeeSensor(StaticUnitSensorBase):
         return self._calculate_daily_fee(usage_gallons)
 
     def _calculate_daily_fee(self, usage_gallons):
-        """Calculate the daily fee based on tiers."""
-        tier1_gallons = self.coordinator.config_entry.data.get("tier1_gallons") or 0
-        tier1_price = self.coordinator.config_entry.data.get("tier1_price")
-        tier2_gallons = self.coordinator.config_entry.data.get("tier2_gallons") or 0
-        tier2_price = self.coordinator.config_entry.data.get("tier2_price") or 0
-        tier3_price = self.coordinator.config_entry.data.get("tier3_price") or 0
+        """Calculate the tiered cost of a single day's usage in isolation.
 
-        cost = 0
-        if usage_gallons is not None:
-            if tier1_gallons == 0:
-                # No tier 1 limit, all usage is charged at tier 1 price
-                cost += usage_gallons * tier1_price
-            elif tier2_gallons == 0:
-                # No tier 2 limit, calculate for tier 1 and tier 2
-                if usage_gallons <= tier1_gallons:
-                    cost += usage_gallons * tier1_price
-                else:
-                    cost += tier1_gallons * tier1_price
-                    cost += (usage_gallons - tier1_gallons) * tier2_price
-            elif tier3_price > 0:
-                # Calculate for all three tiers
-                if usage_gallons <= tier1_gallons:
-                    cost += usage_gallons * tier1_price
-                elif usage_gallons <= tier1_gallons + tier2_gallons:
-                    cost += tier1_gallons * tier1_price
-                    cost += (usage_gallons - tier1_gallons) * tier2_price
-                else:
-                    cost += tier1_gallons * tier1_price
-                    cost += tier2_gallons * tier2_price
-                    cost += (usage_gallons - tier1_gallons - tier2_gallons) * tier3_price
-
+        This re-runs the same tier schedule from zero for just this day's
+        gallons, same as the original implementation - it does not track
+        where the day falls within the monthly billing cycle. A day whose
+        usage alone stays under a configured free allowance will show
+        $0.00 even mid-cycle, once real monthly usage has already used up
+        that allowance; this sensor is a marginal-rate estimate, not a
+        true per-day share of the actual bill.
+        """
+        free_gallons, tiers = self._get_tier_schedule()
+        cost = calculate_tiered_cost(usage_gallons, tiers, free_gallons)
         return round(cost, 2)
 
 
