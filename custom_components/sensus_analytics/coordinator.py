@@ -848,15 +848,19 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         """Fetch daily-granularity entries (zoom=month) for an explicit local-time range.
 
         Sensus's zoom=month endpoint does not reliably honor a narrow
-        start/end window - confirmed returning entries well outside a
+        start/end window - confirmed returning entries well before a
         requested few-day range, evidently always covering at least the
         containing calendar month(s) regardless of how tight start/end
-        are. Every entry is filtered against the requested range before
-        being returned, so a caller asking for a short recent window
-        (the scheduled refresh's default 3-day lookback, in particular)
-        can't silently receive - and reprocess - weeks of unrelated
-        older history using a baseline that was only ever computed for
-        the narrow window it actually asked for.
+        are. Every entry is filtered against the requested lower bound
+        before being returned, so a caller asking for a short recent
+        window (the scheduled refresh's default 3-day lookback, in
+        particular) can't silently receive - and reprocess - weeks of
+        unrelated older history using a baseline that was only ever
+        computed for the narrow window it actually asked for. No upper
+        bound is enforced against end_local: Sensus has no reason to
+        return anything timestamped after "now" (every caller passes
+        the current moment as end_local), so there's nothing real for
+        that to guard against.
         """
         usage_url = urljoin(self.base_url, f"water/usage/{self.account_number}/{self.meter_number}")
         params = {
@@ -886,5 +890,5 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         return [
             (ts_ms, usage, unit)
             for ts_ms, usage, unit in entries
-            if start_local <= dt_util.utc_from_timestamp(ts_ms / 1000) <= end_local
+            if dt_util.utc_from_timestamp(ts_ms / 1000) >= start_local
         ]
