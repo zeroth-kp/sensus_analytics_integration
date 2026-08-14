@@ -845,7 +845,23 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         return entries, bool(payload.get("hasPrev")), payload.get("start")
 
     def _fetch_daily_entries_in_range(self, session, start_local: datetime, end_local: datetime):
-        """Fetch daily-granularity entries (zoom=month) for an explicit local-time range."""
+        """Fetch daily-granularity entries (zoom=month) for an explicit local-time range.
+
+        Sensus's zoom=month endpoint does not reliably honor a narrow
+        start/end window - confirmed returning entries well before a
+        requested few-day range, evidently always covering at least the
+        containing calendar month(s) regardless of how tight start/end
+        are. Every entry is filtered against the requested lower bound
+        before being returned, so a caller asking for a short recent
+        window (the scheduled refresh's default 3-day lookback, in
+        particular) can't silently receive - and reprocess - weeks of
+        unrelated older history using a baseline that was only ever
+        computed for the narrow window it actually asked for. No upper
+        bound is enforced against end_local: Sensus has no reason to
+        return anything timestamped after "now" (every caller passes
+        the current moment as end_local), so there's nothing real for
+        that to guard against.
+        """
         usage_url = urljoin(self.base_url, f"water/usage/{self.account_number}/{self.meter_number}")
         params = {
             "start": int(start_local.timestamp() * 1000),
@@ -870,4 +886,9 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             return []
 
         usage_unit = usage_list[0][0]
-        return [(row[0], row[1], usage_unit) for row in usage_list[1:]]
+        entries = [(row[0], row[1], usage_unit) for row in usage_list[1:]]
+        return [
+            (ts_ms, usage, unit)
+            for ts_ms, usage, unit in entries
+            if dt_util.utc_from_timestamp(ts_ms / 1000) >= start_local
+        ]

@@ -64,6 +64,45 @@ def test_fetch_daily_entries_in_range_uses_explicit_bounds():
     assert captured["params"]["zoom"] == "month"
 
 
+def test_fetch_daily_entries_in_range_filters_response_before_the_lower_bound():
+    """Sensus's zoom=month endpoint doesn't reliably honor a narrow start/end
+    window - it can return entries from well before the requested range
+    (evidently always covering at least the containing calendar month(s)). A
+    caller asking for a short recent window (the scheduled refresh's 3-day
+    default, in particular) must not receive - and reprocess - entries from
+    weeks earlier just because Sensus's response happened to include them.
+    No upper bound is enforced against end_local - Sensus has no reason to
+    return anything timestamped after "now", which every caller passes as
+    end_local, so there's nothing real for that to guard against.
+    """
+    coordinator = _make_coordinator()
+    start_local = datetime(2026, 8, 11, tzinfo=UTC)
+    end_local = datetime(2026, 8, 14, tzinfo=UTC)
+
+    # Simulates Sensus's real behavior: the response reaches back well
+    # before the requested 3-day window even though only that window was
+    # asked for. Both the in-window entry and one right at end_local's day
+    # (still <= "now" in real usage, just past this test's fixed end_local)
+    # should survive; only the far-older one should be filtered out.
+    usage_list = [
+        ["gal"],
+        [int(datetime(2026, 7, 16, 23, 0, tzinfo=UTC).timestamp() * 1000), 40415],
+        [int(datetime(2026, 8, 12, 23, 0, tzinfo=UTC).timestamp() * 1000), 90],
+    ]
+
+    def fake_get(url, params=None, timeout=None):
+        response = SimpleNamespace()
+        response.raise_for_status = lambda: None
+        response.json = lambda: {"operationSuccess": True, "data": {"usage": usage_list}}
+        return response
+
+    session = SimpleNamespace(get=fake_get)
+    entries = coordinator._fetch_daily_entries_in_range(session, start_local, end_local)
+
+    assert len(entries) == 1
+    assert entries[0][1] == 90
+
+
 def test_window_widens_to_reach_old_boundary():
     coordinator = _make_coordinator()
     now = datetime(2026, 7, 20, tzinfo=UTC)
