@@ -64,6 +64,41 @@ def test_fetch_daily_entries_in_range_uses_explicit_bounds():
     assert captured["params"]["zoom"] == "month"
 
 
+def test_fetch_daily_entries_in_range_filters_response_to_requested_bounds():
+    """Sensus's zoom=month endpoint doesn't reliably honor a narrow start/end
+    window - it can return entries well outside the requested range (evidently
+    always covering at least the containing calendar month(s)). A caller
+    asking for a short recent window (the scheduled refresh's 3-day default,
+    in particular) must not receive - and reprocess - entries from weeks
+    earlier just because Sensus's response happened to include them.
+    """
+    coordinator = _make_coordinator()
+    start_local = datetime(2026, 8, 11, tzinfo=UTC)
+    end_local = datetime(2026, 8, 14, tzinfo=UTC)
+
+    # Simulates Sensus's real behavior: the response spans a full month even
+    # though only a 3-day window was requested. Only the middle entry falls
+    # inside [start_local, end_local].
+    usage_list = [
+        ["gal"],
+        [int(datetime(2026, 7, 16, 23, 0, tzinfo=UTC).timestamp() * 1000), 40415],
+        [int(datetime(2026, 8, 12, 23, 0, tzinfo=UTC).timestamp() * 1000), 90],
+        [int(datetime(2026, 8, 20, 23, 0, tzinfo=UTC).timestamp() * 1000), 120],
+    ]
+
+    def fake_get(url, params=None, timeout=None):
+        response = SimpleNamespace()
+        response.raise_for_status = lambda: None
+        response.json = lambda: {"operationSuccess": True, "data": {"usage": usage_list}}
+        return response
+
+    session = SimpleNamespace(get=fake_get)
+    entries = coordinator._fetch_daily_entries_in_range(session, start_local, end_local)
+
+    assert len(entries) == 1
+    assert entries[0][1] == 90
+
+
 def test_window_widens_to_reach_old_boundary():
     coordinator = _make_coordinator()
     now = datetime(2026, 7, 20, tzinfo=UTC)
