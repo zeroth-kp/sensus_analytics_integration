@@ -49,6 +49,18 @@ backfill_daily_history:
       example: "2026-07-05"
       selector:
         date: {}
+    confirm_old_cutover:
+      name: Confirm old cutover date
+      description: >-
+        Required (set to true) when cutover_date is more than 14 days in the
+        past. Normal repairs (a day or two of recently-undercounted usage)
+        never need to reach back that far; this exists so a stray or
+        mistaken call with a stale cutover_date fails loudly instead of
+        silently reprocessing weeks of already-settled history.
+      required: false
+      default: false
+      selector:
+        boolean: {}
     config_entry_id:
       name: Account
       description: >-
