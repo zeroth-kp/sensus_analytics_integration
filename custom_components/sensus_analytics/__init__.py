@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .coordinator import SensusAnalyticsDataUpdateCoordinator
@@ -37,10 +38,20 @@ BACKFILL_HOURLY_SCHEMA = vol.Schema(
 
 SERVICE_BACKFILL_DAILY_HISTORY = "backfill_daily_history"
 ATTR_CUTOVER_DATE = "cutover_date"
+ATTR_CONFIRM_OLD_CUTOVER = "confirm_old_cutover"
+
+# A cutover_date older than this reprocesses daily statistics for days that
+# should already be stable and settled - correcting a recently-undercounted
+# day never needs to reach back this far. Requiring an explicit
+# confirm_old_cutover for anything older turns a stray/mistaken call with a
+# stale cutover_date into a loud validation error instead of a silent
+# rewrite of history that had no reason to be touched.
+OLD_CUTOVER_CONFIRMATION_DAYS = 14
 
 BACKFILL_DAILY_HISTORY_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_CUTOVER_DATE): cv.date,
+        vol.Optional(ATTR_CONFIRM_OLD_CUTOVER, default=False): cv.boolean,
         vol.Optional(ATTR_CONFIG_ENTRY_ID): str,
     }
 )
@@ -131,7 +142,20 @@ def _async_register_services(hass: HomeAssistant) -> None:
         async def _handle_backfill_daily_history(call: ServiceCall) -> None:
             """Backfill historical daily/monthly statistics for the targeted entries."""
             cutover_date = call.data[ATTR_CUTOVER_DATE]
+            confirm_old_cutover = call.data[ATTR_CONFIRM_OLD_CUTOVER]
             config_entry_id = call.data.get(ATTR_CONFIG_ENTRY_ID)
+
+            local_tz = dt_util.get_time_zone(hass.config.time_zone)
+            today_local = datetime.now(local_tz).date()
+            cutover_age_days = (today_local - cutover_date).days
+            if cutover_age_days > OLD_CUTOVER_CONFIRMATION_DAYS and not confirm_old_cutover:
+                raise ServiceValidationError(
+                    f"cutover_date {cutover_date} is {cutover_age_days} days in the past, "
+                    f"past the {OLD_CUTOVER_CONFIRMATION_DAYS}-day threshold for reprocessing "
+                    "days that should already be settled. Pass confirm_old_cutover: true if "
+                    "this is an intentional multi-week-or-older repair."
+                )
+
             for coordinator in _resolve_targets(hass, config_entry_id, "Daily history backfill"):
                 imported = await coordinator.async_backfill_daily_history(cutover_date)
                 _LOGGER.info("Backfilled %s daily/monthly statistics row(s)", imported)
