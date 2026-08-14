@@ -60,11 +60,14 @@ class SensusAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_ACCOUNT_NUMBER): str,
                 vol.Required(CONF_METER_NUMBER): str,
                 vol.Required("unit_type", default="CCF"): vol.In(["CCF", "gal"]),
+                vol.Optional("included_gallons"): cv.positive_float,
                 vol.Optional("tier1_gallons"): cv.positive_float,
-                vol.Required("tier1_price", default=0.0128): cv.positive_float,
+                vol.Required("tier1_price", default=12.80): cv.positive_float,
                 vol.Optional("tier2_gallons"): cv.positive_float,
                 vol.Optional("tier2_price"): cv.positive_float,
+                vol.Optional("tier3_gallons"): cv.positive_float,
                 vol.Optional("tier3_price"): cv.positive_float,
+                vol.Optional("tier4_price"): cv.positive_float,
                 vol.Required("service_fee", default=15.00): cv.positive_float,
                 vol.Optional(
                     CONF_HOUR_SETTLE_DELAY_MINUTES,
@@ -144,12 +147,16 @@ class SensusAnalyticsOptionsFlow(config_entries.OptionsFlow):
                     default=current_data.get("unit_type", "CCF"),
                 ): vol.In(["CCF", "gal"]),
                 vol.Optional(
+                    "included_gallons",
+                    default=current_data.get("included_gallons"),
+                ): cv.positive_float,
+                vol.Optional(
                     "tier1_gallons",
                     default=current_data.get("tier1_gallons"),
                 ): cv.positive_float,
                 vol.Required(
                     "tier1_price",
-                    default=current_data.get("tier1_price", 0.0128),
+                    default=current_data.get("tier1_price", 12.80),
                 ): cv.positive_float,
                 vol.Optional(
                     "tier2_gallons",
@@ -160,8 +167,16 @@ class SensusAnalyticsOptionsFlow(config_entries.OptionsFlow):
                     default=current_data.get("tier2_price"),
                 ): cv.positive_float,
                 vol.Optional(
+                    "tier3_gallons",
+                    default=current_data.get("tier3_gallons"),
+                ): cv.positive_float,
+                vol.Optional(
                     "tier3_price",
                     default=current_data.get("tier3_price"),
+                ): cv.positive_float,
+                vol.Optional(
+                    "tier4_price",
+                    default=current_data.get("tier4_price"),
                 ): cv.positive_float,
                 vol.Required(
                     "service_fee",
