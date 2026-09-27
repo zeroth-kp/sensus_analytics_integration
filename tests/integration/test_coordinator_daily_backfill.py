@@ -23,11 +23,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.components.recorder.common import async_wait_recording_done
 
 from custom_components.sensus_analytics.const import DOMAIN
 from custom_components.sensus_analytics.coordinator import SensusAnalyticsDataUpdateCoordinator
 
-from .conftest import config_entry_data, make_mock_session
+from .conftest import baseline_race_errors, config_entry_data, make_mock_session
 
 UTC = timezone.utc
 
@@ -236,7 +237,7 @@ def test_monthly_totals_only_include_entries_before_boundary():
 
 
 @pytest.mark.asyncio
-async def test_async_backfill_daily_history_end_to_end(recorder_mock, enable_custom_integrations, hass):
+async def test_async_backfill_daily_history_end_to_end(fixture_now, recorder_mock, enable_custom_integrations, hass):
     entry = MockConfigEntry(domain=DOMAIN, data=config_entry_data())
     entry.add_to_hass(hass)
 
@@ -259,7 +260,9 @@ async def test_async_backfill_daily_history_end_to_end(recorder_mock, enable_cus
 
 
 @pytest.mark.asyncio
-async def test_backfill_bridges_existing_sum_across_a_retention_gap(recorder_mock, enable_custom_integrations, hass):
+async def test_backfill_bridges_existing_sum_across_a_retention_gap(
+    fixture_now, recorder_mock, enable_custom_integrations, hass
+):
     """A re-run whose cutover month Sensus can no longer fully re-derive (its
     daily-granularity retention starts later than the cutover month, as
     make_mock_session's fixed 2026-07-20 DAILY_RESPONSE does relative to a
@@ -270,9 +273,8 @@ async def test_backfill_bridges_existing_sum_across_a_retention_gap(recorder_moc
 
     Builds the coordinator directly rather than through
     hass.config_entries.async_setup, so the platform's automatic
-    startup-triggered scheduled refresh (which runs against real wall-clock
-    "now", not this test's fixed 2026 dates) can't interfere with the
-    controlled scenario below.
+    startup-triggered scheduled refresh can't interfere with the controlled
+    scenario below.
     """
     from homeassistant.components.recorder import get_instance
     from homeassistant.components.recorder.models import StatisticData
@@ -305,16 +307,14 @@ async def test_backfill_bridges_existing_sum_across_a_retention_gap(recorder_moc
         [StatisticData(start=pre_existing_hour, state=0, sum=existing_sum, last_reset=pre_existing_hour)],
         "test seed",
     )
-    await hass.async_block_till_done()
-    await get_instance(hass).async_block_till_done()
+    await async_wait_recording_done(hass)
 
     with patch(
         "custom_components.sensus_analytics.coordinator.requests.Session",
         return_value=make_mock_session(),
     ):
         await coordinator.async_backfill_daily_history(datetime(2026, 6, 1).date())
-    await hass.async_block_till_done()
-    await get_instance(hass).async_block_till_done()
+    await async_wait_recording_done(hass)
 
     stats = await get_instance(hass).async_add_executor_job(
         statistics_during_period,
@@ -336,7 +336,7 @@ async def test_backfill_bridges_existing_sum_across_a_retention_gap(recorder_moc
 
 @pytest.mark.asyncio
 async def test_backfill_aborts_when_a_write_races_the_bridging_baseline(
-    recorder_mock, enable_custom_integrations, hass, caplog
+    fixture_now, recorder_mock, enable_custom_integrations, hass, caplog
 ):
     """A second write (another concurrent backfill/refresh call, or a manual
     recorder/adjust_sum_statistics correction) lands on the bridging anchor
@@ -371,23 +371,27 @@ async def test_backfill_aborts_when_a_write_races_the_bridging_baseline(
         [StatisticData(start=pre_existing_hour, state=0, sum=existing_sum, last_reset=pre_existing_hour)],
         "test seed",
     )
-    await hass.async_block_till_done()
-    await get_instance(hass).async_block_till_done()
+    await async_wait_recording_done(hass)
 
     # First call: the real bridging read (matches the seeded value). Second
     # call: the pre-write verification, made to see a different number - as
     # if a different write had landed on the same statistic in between.
     coordinator._get_existing_sum_before = AsyncMock(side_effect=[existing_sum, existing_sum + 999_999.0])
 
-    with patch(
-        "custom_components.sensus_analytics.coordinator.requests.Session",
-        return_value=make_mock_session(),
-    ), caplog.at_level("ERROR"):
+    with (
+        patch(
+            "custom_components.sensus_analytics.coordinator.requests.Session",
+            return_value=make_mock_session(),
+        ),
+        caplog.at_level("ERROR"),
+    ):
         imported = await coordinator.async_backfill_daily_history(datetime(2026, 6, 1).date())
+    await async_wait_recording_done(hass)
 
     assert imported == 0
-    assert "changed" in caplog.text
-    assert statistic_id in caplog.text
+    race_errors = baseline_race_errors(caplog)
+    assert len(race_errors) == 1
+    assert statistic_id in race_errors[0].getMessage()
 
     stats = await get_instance(hass).async_add_executor_job(
         statistics_during_period,

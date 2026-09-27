@@ -7,33 +7,31 @@ _scheduled_daily_refresh) to stay fresh between manual
 backfill_daily_history calls.
 """
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.helpers.event import async_track_time_interval
 from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.components.recorder.common import async_wait_recording_done
 
 from custom_components.sensus_analytics.const import DOMAIN
 from custom_components.sensus_analytics.coordinator import SensusAnalyticsDataUpdateCoordinator
 
-from .conftest import config_entry_data, make_mock_session
+from .conftest import baseline_race_errors, config_entry_data, make_mock_session
 
-# make_mock_session's fixed DAILY_RESPONSE entry lands on 2026-07-20. Now that
-# the scheduled refresh's trailing window is actually enforced (rather than
-# silently including everything Sensus's zoom=month response happens to
-# return), tests need a `days` wide enough for that fixed date to still fall
-# inside it relative to the real wall clock - matching the 60-day "safe
-# historical minimum" already used elsewhere in this module, rather than
-# mocking `datetime` broadly (which would also break the canonical-hour
-# `datetime.combine` call inside _build_daily_statistics, in the same
-# call chain).
-_DAYS_WIDE_ENOUGH_FOR_FIXTURE = 60
+# The refresh's trailing window is measured back from "now", and
+# make_mock_session's DAILY_RESPONSE entry is at a fixed date. Tests that
+# expect that entry to be picked up request the `fixture_now` fixture, which
+# freezes the clock two days after it - inside the default 3-day window no
+# matter when the suite actually runs.
 
 
 @pytest.mark.asyncio
-async def test_setup_registers_and_cancels_scheduled_refresh(recorder_mock, enable_custom_integrations, hass):
+async def test_setup_registers_and_cancels_scheduled_refresh(
+    fixture_now, recorder_mock, enable_custom_integrations, hass
+):
     entry = MockConfigEntry(domain=DOMAIN, data=config_entry_data())
     entry.add_to_hass(hass)
 
@@ -57,7 +55,9 @@ async def test_setup_registers_and_cancels_scheduled_refresh(recorder_mock, enab
 
 
 @pytest.mark.asyncio
-async def test_refresh_imports_statistics_with_baseline_sum(recorder_mock, enable_custom_integrations, hass):
+async def test_refresh_imports_statistics_with_baseline_sum(
+    fixture_now, recorder_mock, enable_custom_integrations, hass
+):
     entry = MockConfigEntry(domain=DOMAIN, data=config_entry_data())
     entry.add_to_hass(hass)
 
@@ -74,16 +74,18 @@ async def test_refresh_imports_statistics_with_baseline_sum(recorder_mock, enabl
         "custom_components.sensus_analytics.coordinator.requests.Session",
         return_value=make_mock_session(),
     ):
-        imported = await coordinator.async_refresh_recent_daily_statistics(days=_DAYS_WIDE_ENOUGH_FOR_FIXTURE)
+        imported = await coordinator.async_refresh_recent_daily_statistics()
 
-    # DAILY_RESPONSE's single 2026-07-20 entry falls inside the widened
-    # trailing window, so the refresh should actually import it - not just
+    # DAILY_RESPONSE's single entry falls inside the default trailing window
+    # at the frozen time, so the refresh should actually import it - not just
     # return >= 0, which a wrongly-empty result would also satisfy.
     assert imported > 0
 
 
 @pytest.mark.asyncio
-async def test_refresh_aborts_when_a_write_races_the_baseline(recorder_mock, enable_custom_integrations, hass, caplog):
+async def test_refresh_aborts_when_a_write_races_the_baseline(
+    fixture_now, recorder_mock, enable_custom_integrations, hass, caplog
+):
     """A concurrent write to the same statistic between this refresh's
     baseline read and its own write must be detected and abort the run,
     instead of silently overwriting using the now-stale baseline.
@@ -111,15 +113,16 @@ async def test_refresh_aborts_when_a_write_races_the_baseline(recorder_mock, ena
         ),
         caplog.at_level("ERROR"),
     ):
-        imported = await coordinator.async_refresh_recent_daily_statistics(days=_DAYS_WIDE_ENOUGH_FOR_FIXTURE)
+        imported = await coordinator.async_refresh_recent_daily_statistics()
 
     assert imported == 0
-    assert "changed" in caplog.text
+    assert len(baseline_race_errors(caplog)) == 1
+    assert coordinator._get_existing_sum_before.await_count == 2
 
 
 @pytest.mark.asyncio
 async def test_refresh_does_not_reprocess_an_entry_outside_its_requested_window(
-    recorder_mock, enable_custom_integrations, hass
+    fixture_now, recorder_mock, enable_custom_integrations, hass
 ):
     """Direct regression test for the real production incident this fix
     addresses: Sensus's zoom=month endpoint returned an entry from nearly a
@@ -158,11 +161,9 @@ async def test_refresh_does_not_reprocess_an_entry_outside_its_requested_window(
         [StatisticData(start=old_canonical_hour, state=33.8, sum=correct_old_sum, last_reset=old_canonical_hour)],
         "test seed",
     )
-    await hass.async_block_till_done()
-    await get_instance(hass).async_block_till_done()
+    await async_wait_recording_done(hass)
 
-    now = datetime.now(timezone.utc)
-    recent_entry_ts_ms = int((now - timedelta(hours=6)).timestamp() * 1000)
+    recent_entry_ts_ms = int((fixture_now - timedelta(hours=6)).timestamp() * 1000)
     # Simulates Sensus's real behavior: zoom=month returns an entry far
     # outside the requested narrow window (the same shape as the real
     # incident - an entry from nearly a month earlier) alongside the
@@ -189,8 +190,7 @@ async def test_refresh_does_not_reprocess_an_entry_outside_its_requested_window(
         return_value=SimpleNamespace(get=fake_get, post=lambda *a, **k: SimpleNamespace(status_code=302)),
     ):
         await coordinator.async_refresh_recent_daily_statistics(days=3)
-    await hass.async_block_till_done()
-    await get_instance(hass).async_block_till_done()
+    await async_wait_recording_done(hass)
 
     stats = await get_instance(hass).async_add_executor_job(
         statistics_during_period,
