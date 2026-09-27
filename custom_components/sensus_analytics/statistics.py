@@ -6,6 +6,10 @@ rebuild running sums forward from the last row before the start (so runs are
 idempotent and late corrections just replace values), then read the range
 back and verify the chain, raising a Repairs issue on failure. Nothing is
 written before the oldest day Sensus still has hourly data for.
+
+The ``statistics_target`` option picks the statistic: ``shadow`` (a separate
+external statistic nothing reads) or ``live`` (the Daily Usage sensor's own
+statistic, keeping its existing metadata; the legacy writers are disabled).
 """
 
 from __future__ import annotations
@@ -17,10 +21,16 @@ import time as time_module
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, tzinfo
+from functools import partial
 from typing import Any
 
 from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.statistics import async_add_external_statistics, statistics_during_period
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    async_import_statistics,
+    get_metadata,
+    statistics_during_period,
+)
 from homeassistant.components.recorder.tasks import SynchronizeTask
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
@@ -28,7 +38,9 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_HOUR_SETTLE_DELAY_MINUTES,
+    CONF_STATISTICS_TARGET,
     DEFAULT_HOUR_SETTLE_DELAY_MINUTES,
+    DEFAULT_STATISTICS_TARGET,
     DOMAIN,
     FETCH_DAY_DELAY_SECONDS,
     FETCH_RETRIES,
@@ -36,6 +48,8 @@ from .const import (
     IMPORT_CHUNK_HOURS,
     MAX_PLAUSIBLE_HOURLY_USAGE_GAL,
     PROBE_MAX_DAYS,
+    STATISTICS_TARGET_LIVE,
+    STATISTICS_TARGETS,
     SYNC_TRAILING_DAYS,
 )
 from .coordinator import SensusFetchError, StatisticData, StatisticMetaData, apply_sum_statistic_fields
@@ -299,7 +313,7 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
         self.hass = hass
         self.coordinator = coordinator
         self.entry = coordinator.config_entry
-        self.statistic_id = f"{DOMAIN}:{self.entry.entry_id.lower()}_water_shadow"
+        self.shadow_statistic_id = f"{DOMAIN}:{self.entry.entry_id.lower()}_water_shadow"
         self._lock = asyncio.Lock()
         self._poll_task: asyncio.Task | None = None
         self._last_clean_fingerprint: tuple | None = None
@@ -313,6 +327,22 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
     def local_tz(self) -> tzinfo:
         """Return Home Assistant's configured time zone."""
         return dt_util.get_time_zone(self.hass.config.time_zone) or dt_util.DEFAULT_TIME_ZONE
+
+    @property
+    def target(self) -> str:
+        """Return the configured statistics target (unknown values fall back to shadow)."""
+        target = self.entry.data.get(CONF_STATISTICS_TARGET, DEFAULT_STATISTICS_TARGET)
+        return target if target in STATISTICS_TARGETS else DEFAULT_STATISTICS_TARGET
+
+    @property
+    def is_live(self) -> bool:
+        """Return whether the importer writes the live Daily Usage statistic."""
+        return self.target == STATISTICS_TARGET_LIVE
+
+    @property
+    def statistic_id(self) -> str:
+        """Return the id of the statistic the importer currently writes."""
+        return self.coordinator.daily_usage_statistic_id() if self.is_live else self.shadow_statistic_id
 
     @property
     def unit(self) -> str | None:
@@ -340,11 +370,15 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
         return self.local_midnight(today - timedelta(days=SYNC_TRAILING_DAYS))
 
     def build_metadata(self, unit: str) -> StatisticMetaData:
-        """Return the statistic's metadata."""
+        """Return the metadata for the current target.
+
+        The live target keeps the Daily Usage statistic's existing metadata:
+        recorder source, no name, the configured unit, sum only.
+        """
         metadata = StatisticMetaData(
             has_sum=True,
-            name=SHADOW_STATISTIC_NAME,
-            source=DOMAIN,
+            name=None if self.is_live else SHADOW_STATISTIC_NAME,
+            source="recorder" if self.is_live else DOMAIN,
             statistic_id=self.statistic_id,
             unit_of_measurement=unit,
         )
@@ -360,6 +394,9 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
         if self._poll_task is not None and not self._poll_task.done():
             return
         fingerprint = self._poll_fingerprint()
+        if self._last_clean_fingerprint is not None and fingerprint[0] != self._last_clean_fingerprint[0]:
+            # The target changed; a resync range found on the old target doesn't apply.
+            self._resync_from = None
         if fingerprint == self._last_clean_fingerprint and self._resync_from is None:
             return
         self._poll_task = self.entry.async_create_background_task(
@@ -370,7 +407,7 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
         data = self.coordinator.data or {}
         hourly = data.get("hourly_usage_data") or []
         cutoff = settled_end(dt_util.utcnow(), self.settle_delay_minutes)
-        return (cutoff, tuple((entry.get("timestamp"), entry.get("usage")) for entry in hourly))
+        return (self.target, cutoff, tuple((entry.get("timestamp"), entry.get("usage")) for entry in hourly))
 
     async def _async_poll_sync(self, fingerprint: tuple) -> None:
         start = self.poll_window_start()
@@ -450,15 +487,11 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
 
     async def _async_sync_locked(self, start: datetime, reason: str) -> SyncResult:  # pylint: disable=too-many-locals
         unit = self.unit
-        if unit is None:
-            return SyncResult(False, reason, error=f"unsupported unit {self.entry.data.get('unit_type')!r}")
-
         start = floor_to_hour(dt_util.as_utc(start))
-        if start < self.poll_window_start():
-            floor = await self.async_get_floor()
-            if floor is None:
-                return SyncResult(False, reason, error="retention floor unknown; refusing a long sync")
-            start = max(start, self.local_midnight(floor))
+        start, problem = await self._async_preflight(start, unit)
+        if problem:
+            _LOGGER.error("Statistics sync (%s) for %s wrote nothing: %s", reason, self.statistic_id, problem)
+            return SyncResult(False, reason, first_hour=start, error=problem)
 
         cutoff = settled_end(dt_util.utcnow(), self.settle_delay_minutes)
         if start >= cutoff:
@@ -533,11 +566,49 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
                     session = self.coordinator.open_session()
         return fetched
 
+    async def _async_preflight(self, start: datetime, unit: str | None) -> tuple[datetime, str | None]:
+        """Clamp ``start`` to the retention floor and check it is safe to write.
+
+        Returns the (possibly clamped) start and, when writing must not
+        happen, the reason.
+        """
+        if unit is None:
+            return start, f"unsupported unit {self.entry.data.get('unit_type')!r}"
+        if start < self.poll_window_start():
+            floor = await self.async_get_floor()
+            if floor is None:
+                return start, "retention floor unknown; refusing a long sync"
+            start = max(start, self.local_midnight(floor))
+        return start, await self._async_metadata_problem(unit)
+
+    async def _async_metadata_problem(self, unit: str) -> str | None:
+        """Return why writing would conflict with the statistic's stored metadata, if it would.
+
+        Writing rows under a different unit than the stored one makes the
+        recorder stop compiling that statistic, so refuse instead.
+        """
+        statistic_id = self.statistic_id
+        stored = await get_instance(self.hass).async_add_executor_job(
+            partial(get_metadata, self.hass, statistic_ids={statistic_id})
+        )
+        if statistic_id not in stored:
+            return None
+        _, meta = stored[statistic_id]
+        if meta.get("unit_of_measurement") != unit:
+            return (
+                f"stored unit {meta.get('unit_of_measurement')!r} does not match the configured unit {unit!r}; "
+                "refusing to write"
+            )
+        if not meta.get("has_sum"):
+            return "stored statistic has no sum; refusing to write"
+        return None
+
     def _write_rows(self, unit: str, rows: list[tuple[datetime, float, float]]) -> None:
         metadata = self.build_metadata(unit)
+        write = async_import_statistics if self.is_live else async_add_external_statistics
         statistics = [StatisticData(start=hour, state=state, sum=total) for hour, state, total in rows]
         for index in range(0, len(statistics), IMPORT_CHUNK_HOURS):
-            async_add_external_statistics(self.hass, metadata, statistics[index : index + IMPORT_CHUNK_HOURS])
+            write(self.hass, metadata, statistics[index : index + IMPORT_CHUNK_HOURS])
 
     async def _async_wait_for_commit(self) -> None:
         """Wait until every statistics write queued so far has been committed.
@@ -585,6 +656,10 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
 
     async def _async_verify_locked(self, start: datetime) -> VerifyResult:
         start = floor_to_hour(dt_util.as_utc(start))
+        if self._floor_day is not None:
+            # Rows before the floor can't be rewritten (and may be one per day
+            # from older imports), so the hourly chain is only checked from there.
+            start = max(start, self.local_midnight(self._floor_day))
         anchor = await self._async_sum_before(start)
         rows = await self._async_read(start, None, {"state", "sum"})
         result = check_sum_chain(rows, anchor, start)

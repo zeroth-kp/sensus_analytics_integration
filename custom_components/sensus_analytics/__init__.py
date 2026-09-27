@@ -124,6 +124,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _async_register_services(hass)
 
     async def _scheduled_daily_refresh(_now=None) -> None:
+        if not coordinator.legacy_statistics_enabled:
+            # The hourly statistics importer owns the Daily Usage statistic.
+            return
         try:
             await coordinator.async_refresh_recent_daily_statistics()
         except Exception:  # pylint: disable=broad-except
