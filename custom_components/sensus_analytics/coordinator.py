@@ -30,6 +30,15 @@ except ImportError:  # pragma: no cover - older HA cores
 
     _MEAN_NONE = None
 
+# Statistics metadata gained a ``unit_class`` field; Home Assistant requires it
+# for imported statistics from 2026.11. Older cores have no such field.
+try:
+    from homeassistant.util.unit_conversion import VolumeConverter
+
+    _VOLUME_UNIT_CLASS = VolumeConverter.UNIT_CLASS
+except (ImportError, AttributeError):  # pragma: no cover - older HA cores
+    _VOLUME_UNIT_CLASS = None
+
 
 class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching data from the API."""
@@ -434,6 +443,8 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             metadata["mean_type"] = _MEAN_NONE
         else:
             metadata["has_mean"] = False
+        if _VOLUME_UNIT_CLASS is not None:
+            metadata["unit_class"] = _VOLUME_UNIT_CLASS
         async_import_statistics(self.hass, metadata, statistics)
         _LOGGER.log(level, "%s: imported %s statistics row(s) for %s", log_label, len(statistics), statistic_id)
         return len(statistics)
