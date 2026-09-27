@@ -7,56 +7,54 @@ from urllib.parse import urljoin
 
 import requests
 from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import StatisticData, StatisticMeanType, StatisticMetaData
 from homeassistant.components.recorder.statistics import async_import_statistics, statistics_during_period
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
+from homeassistant.util.unit_conversion import VolumeConverter
 
 from .const import CONF_ACCOUNT_NUMBER, CONF_BASE_URL, CONF_METER_NUMBER, CONF_PASSWORD, CONF_USERNAME, DOMAIN
 from .usage_conversion import convert_usage_value
 
 _LOGGER = logging.getLogger(__name__)
 
-# StatisticMetaData replaced the ``has_mean`` bool with ``mean_type`` during the
-# 2025.x cycle. Import the enum when available and fall back for older cores so
-# the backfill works across HA versions.
-try:  # HA >= 2025.2
-    from homeassistant.components.recorder.models import StatisticData, StatisticMeanType, StatisticMetaData
-
-    _MEAN_NONE = StatisticMeanType.NONE
-except ImportError:  # pragma: no cover - older HA cores
-    from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
-
-    _MEAN_NONE = None
-
-# Statistics metadata gained a ``unit_class`` field; Home Assistant requires it
-# for imported statistics from 2026.11. Older cores have no such field.
-try:
-    from homeassistant.util.unit_conversion import VolumeConverter
-
-    _VOLUME_UNIT_CLASS = VolumeConverter.UNIT_CLASS
-except (ImportError, AttributeError):  # pragma: no cover - older HA cores
-    _VOLUME_UNIT_CLASS = None
-
 
 def apply_sum_statistic_fields(metadata: StatisticMetaData) -> StatisticMetaData:
-    """Set the mean and unit-class fields a volume sum statistic needs on this HA core.
-
-    Populates the mean field under whichever key this core expects, and sets
-    ``unit_class`` where the core supports it.
-    """
-    if _MEAN_NONE is not None:
-        metadata["mean_type"] = _MEAN_NONE
-    else:  # pragma: no cover - older HA cores
-        metadata["has_mean"] = False
-    if _VOLUME_UNIT_CLASS is not None:
-        metadata["unit_class"] = _VOLUME_UNIT_CLASS
+    """Set the mean type and unit class a volume sum statistic needs."""
+    metadata["mean_type"] = StatisticMeanType.NONE
+    metadata["unit_class"] = VolumeConverter.UNIT_CLASS
     return metadata
 
 
 class SensusFetchError(Exception):
     """A Sensus request failed at the transport or response-format level."""
+
+
+def parse_hourly_rows(usage_list: list) -> list[dict]:
+    """Convert Sensus's ``[units, [ts, usage, rain, temp], ...]`` list into entry dicts."""
+    units = usage_list[0]
+    if not isinstance(units, list) or not units:
+        raise SensusFetchError("Hourly data response did not include units")
+    usage_unit, rain_unit, temp_unit = (units + [None, None])[:3]
+    entries = []
+    for row in usage_list[1:]:
+        if not isinstance(row, list) or len(row) < 2:
+            raise SensusFetchError("Hourly data response contained a malformed row")
+        timestamp, usage, rain, temp = (row + [None, None])[:4]
+        entries.append(
+            {
+                "timestamp": timestamp,
+                "usage": usage,
+                "rain": rain,
+                "temp": temp,
+                "usage_unit": usage_unit,
+                "rain_unit": rain_unit,
+                "temp_unit": temp_unit,
+            }
+        )
+    return entries
 
 
 class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
@@ -160,30 +158,16 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         return data
 
     def _retrieve_hourly_data(self, session: requests.Session, target_date: datetime):
-        """Retrieve hourly usage data for a specific date based on local time."""
-        # Prepare request parameters
-        start_ts, end_ts = self._get_start_end_timestamps(target_date)
-        usage_url, params = self._construct_hourly_data_request(start_ts, end_ts)
-
-        _LOGGER.debug("Hourly data request URL: %s", usage_url)
-        _LOGGER.debug("Hourly data request parameters: %s", params)
-
+        """Return hourly entries for a local date, or None if there are none or the fetch failed."""
         try:
-            response = session.get(usage_url, params=params, timeout=10)
-            response.raise_for_status()
-            hourly_data = response.json()
-            _LOGGER.debug("Hourly data response: %s", hourly_data)
-
-            # Validate and process the response
-            hourly_entries = self._process_hourly_data_response(hourly_data)
-            return hourly_entries
-
-        except requests.exceptions.RequestException as e:
-            _LOGGER.error("Hourly data retrieval failed: %s", e)
+            entries = self.fetch_hourly_day(session, target_date)
+        except SensusFetchError as error:
+            _LOGGER.error("Hourly data retrieval failed: %s", error)
             return None
-        except (KeyError, TypeError, ValueError) as e:
-            _LOGGER.error("Error processing the hourly data response: %s", e)
+        if not entries:
+            _LOGGER.error("Hourly usage data is missing, incomplete, or reported as unsuccessful.")
             return None
+        return entries
 
     def _get_start_end_timestamps(self, target_date):
         """Get start and end timestamps in milliseconds for the target date."""
@@ -211,46 +195,6 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         }
         return usage_url, params
 
-    def _process_hourly_data_response(self, hourly_data):
-        """Process and structure the hourly data response."""
-        if not isinstance(hourly_data, dict):
-            _LOGGER.error("Unexpected response format for hourly data.")
-            return None
-
-        if not hourly_data.get("operationSuccess", False):
-            errors = hourly_data.get("errors", [])
-            _LOGGER.error("API returned errors: %s", errors)
-            return None
-
-        usage_list = hourly_data.get("data", {}).get("usage", [])
-        if not usage_list or len(usage_list) < 2:
-            _LOGGER.error("Hourly usage data is missing or incomplete.")
-            return None
-
-        # The first element contains units
-        units = usage_list[0]  # ["CCF", "INCHES", "FAHRENHEIT", "gal"]
-        usage_unit = units[0]
-        rain_unit = units[1]
-        temp_unit = units[2]
-
-        # The rest of the list contains hourly data
-        hourly_entries = []
-        for entry in usage_list[1:]:
-            timestamp, usage, rain, temp = entry[:4]
-            hourly_entries.append(
-                {
-                    "timestamp": timestamp,
-                    "usage": usage,
-                    "rain": rain,
-                    "temp": temp,
-                    "usage_unit": usage_unit,
-                    "rain_unit": rain_unit,
-                    "temp_unit": temp_unit,
-                }
-            )
-
-        return hourly_entries
-
     def open_session(self) -> requests.Session:
         """Return a newly authenticated session (blocking; run in an executor)."""
         try:
@@ -263,15 +207,11 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
     def fetch_hourly_day(self, session: requests.Session, day) -> list | None:
         """Fetch one local day's hourly entries (blocking; run in an executor).
 
-        Unlike ``_retrieve_hourly_data``, failures are not folded into a
-        ``None`` result, so callers can tell the cases apart:
-
         - raises ``SensusFetchError`` for transport errors and malformed responses;
         - returns ``None`` when Sensus answers but reports the request as unsuccessful;
         - returns ``[]`` when Sensus answers successfully with no hourly rows.
 
-        Entries use the same shape as ``_process_hourly_data_response``. No
-        filtering is applied here - the caller validates the requested window.
+        No filtering is applied - callers validate the requested window.
         """
         start_ts, end_ts = self._get_start_end_timestamps(day)
         usage_url, params = self._construct_hourly_data_request(start_ts, end_ts)
@@ -293,16 +233,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         usage_list = data.get("usage") if isinstance(data, dict) else None
         if not usage_list or len(usage_list) < 2:
             return []
-        units = usage_list[0]
-        if not isinstance(units, list) or not units:
-            raise SensusFetchError("Hourly data response did not include units")
-
-        entries = []
-        for row in usage_list[1:]:
-            if not isinstance(row, list) or len(row) < 2:
-                raise SensusFetchError("Hourly data response contained a malformed row")
-            entries.append({"timestamp": row[0], "usage": row[1], "usage_unit": units[0]})
-        return entries
+        return parse_hourly_rows(usage_list)
 
     # ------------------------------------------------------------------
     # One-time hourly-statistics backfill

@@ -223,26 +223,30 @@ def test_check_sum_chain_accepts_a_consistent_chain():
     assert result.ok and result.rows_checked == 3
 
 
-def test_check_sum_chain_reports_a_broken_sum():
-    rows = _rows(WINDOW_START, [1, 1, 1], anchor=10)
+def _break_sum(rows):
     rows[1]["sum"] += 5
+
+
+def _drop_hour(rows):
+    del rows[1]
+
+
+def _negate_state(rows):
+    rows[1]["state"] = -1
+    rows[1]["sum"] = rows[0]["sum"] - 1
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "problem"),
+    [(_break_sum, "is not previous sum"), (_drop_hour, "expected a row"), (_negate_state, "negative state")],
+)
+def test_check_sum_chain_reports_the_first_bad_hour(corrupt, problem):
+    rows = _rows(WINDOW_START, [1, 1, 1], anchor=10)
+    corrupt(rows)
     result = check_sum_chain(rows, 10, WINDOW_START)
     assert not result.ok
     assert result.first_bad_hour == WINDOW_START + HOUR
-
-
-def test_check_sum_chain_reports_a_missing_hour():
-    rows = _rows(WINDOW_START, [1, 1, 1], anchor=0)
-    del rows[1]
-    result = check_sum_chain(rows, 0, WINDOW_START)
-    assert not result.ok
-    assert result.first_bad_hour == WINDOW_START + HOUR
-    assert "expected a row" in result.problem
-
-
-def test_check_sum_chain_reports_a_negative_state():
-    rows = _rows(WINDOW_START, [1, -1], anchor=0)
-    assert not check_sum_chain(rows, 0, WINDOW_START).ok
+    assert problem in result.problem
 
 
 def test_check_sum_chain_without_an_anchor_starts_at_the_first_row():

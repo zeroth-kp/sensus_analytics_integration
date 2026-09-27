@@ -1,25 +1,11 @@
 """Single-writer importer for hourly water-usage long-term statistics.
 
-Every write to the importer's statistic goes through ``async_sync``, which:
-
-1. fetches hourly usage one local day at a time, from ``start`` through the
-   latest *settled* hour (an hour counts as settled once it ended at least
-   the configured settle delay ago);
-2. validates every day before anything is written - entries outside the
-   requested day are dropped, and a negative, non-finite, implausibly large,
-   duplicated or unconvertible value fails the whole run;
-3. rebuilds the running sum forward from the last row before ``start``,
-   never adjusting existing sums incrementally, so a run is idempotent and a
-   late correction simply replaces the old value on the next run;
-4. rebuilds the sums (not the values) of any rows already stored after the
-   last written hour, so the chain stays continuous;
-5. waits for the recorder to commit, then reads the range back and checks
-   that every hour is present and every sum equals the previous sum plus
-   that hour's value. A failure raises a Repairs issue and widens the next
-   poll-triggered run to re-cover the broken range.
-
-Nothing is ever written before the retention floor: the oldest local day
-Sensus still has hourly data for, found by ``async_probe_retention``.
+Every write goes through ``async_sync``: fetch hourly usage per local day up to
+the latest settled hour, validate everything (any bad value writes nothing),
+rebuild running sums forward from the last row before the start (so runs are
+idempotent and late corrections just replace values), then read the range
+back and verify the chain, raising a Repairs issue on failure. Nothing is
+written before the oldest day Sensus still has hourly data for.
 """
 
 from __future__ import annotations
@@ -29,12 +15,13 @@ import logging
 import math
 import time as time_module
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, tzinfo
 from typing import Any
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import async_add_external_statistics, statistics_during_period
+from homeassistant.components.recorder.tasks import SynchronizeTask
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
@@ -54,11 +41,6 @@ from .const import (
 from .coordinator import SensusFetchError, StatisticData, StatisticMetaData, apply_sum_statistic_fields
 from .usage_conversion import convert_usage_value
 
-try:
-    from homeassistant.components.recorder.tasks import SynchronizeTask
-except ImportError:  # pragma: no cover - older HA cores
-    SynchronizeTask = None
-
 _LOGGER = logging.getLogger(__name__)
 
 ONE_HOUR = timedelta(hours=1)
@@ -75,8 +57,25 @@ class StatisticsValidationError(Exception):
     """Fetched hourly data failed validation, so nothing was written."""
 
 
+def _jsonable(value: Any) -> Any:
+    """Convert datetimes (at any depth) to ISO strings for service responses."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    return value
+
+
+class _ResponseMixin:  # pylint: disable=too-few-public-methods
+    """Service-response representation for result dataclasses."""
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a service-response friendly representation."""
+        return _jsonable(asdict(self))
+
+
 @dataclass(frozen=True)
-class VerifyResult:
+class VerifyResult(_ResponseMixin):
     """Outcome of reading a statistic back and checking its sum chain."""
 
     ok: bool
@@ -84,18 +83,9 @@ class VerifyResult:
     first_bad_hour: datetime | None = None
     problem: str | None = None
 
-    def as_dict(self) -> dict[str, Any]:
-        """Return a service-response friendly representation."""
-        return {
-            "ok": self.ok,
-            "rows_checked": self.rows_checked,
-            "first_bad_hour": self.first_bad_hour.isoformat() if self.first_bad_hour else None,
-            "problem": self.problem,
-        }
-
 
 @dataclass(frozen=True)
-class SyncResult:  # pylint: disable=too-many-instance-attributes
+class SyncResult(_ResponseMixin):  # pylint: disable=too-many-instance-attributes
     """Outcome of one ``async_sync`` run."""
 
     ok: bool
@@ -106,19 +96,6 @@ class SyncResult:  # pylint: disable=too-many-instance-attributes
     zero_filled_hours: int = 0
     error: str | None = None
     verify: VerifyResult | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        """Return a service-response friendly representation."""
-        return {
-            "ok": self.ok,
-            "reason": self.reason,
-            "rows_written": self.rows_written,
-            "first_hour": self.first_hour.isoformat() if self.first_hour else None,
-            "last_hour": self.last_hour.isoformat() if self.last_hour else None,
-            "zero_filled_hours": self.zero_filled_hours,
-            "error": self.error,
-            "verify": self.verify.as_dict() if self.verify else None,
-        }
 
 
 # ----------------------------------------------------------------------
@@ -132,11 +109,7 @@ def floor_to_hour(moment: datetime) -> datetime:
 
 
 def local_day_bounds(day: date, local_tz: tzinfo) -> tuple[datetime, datetime]:
-    """Return the UTC start (inclusive) and end (exclusive) of a local calendar day.
-
-    Handles 23- and 25-hour days at DST transitions, since both bounds are
-    local midnights converted independently.
-    """
+    """Return a local day's UTC start (inclusive) and end (exclusive); DST days are 23 or 25 hours."""
     start = dt_util.as_utc(datetime.combine(day, time.min, tzinfo=local_tz))
     end = dt_util.as_utc(datetime.combine(day + timedelta(days=1), time.min, tzinfo=local_tz))
     return start, end
@@ -150,11 +123,9 @@ def local_days_between(start: datetime, end: datetime, local_tz: tzinfo) -> list
 
 
 def settled_end(now: datetime, settle_delay_minutes: int) -> datetime:
-    """Return the start of the first hour that is not yet settled.
+    """Return the start of the first unsettled hour (settled = ended at least the delay ago).
 
-    An hour is settled once it ended at least ``settle_delay_minutes`` ago,
-    so every hour strictly before the returned value is settled. Matches the
-    Last Hour Usage sensor's notion of the most recent completed hour.
+    Matches the Last Hour Usage sensor's notion of the most recent completed hour.
     """
     return floor_to_hour(now - timedelta(minutes=settle_delay_minutes))
 
@@ -209,12 +180,9 @@ def parse_day_entries(
 ) -> dict[datetime, float]:
     """Validate one day's hourly entries and return ``{utc_hour_start: value}``.
 
-    Entries whose hour falls outside ``[window_start, window_end)`` are
-    dropped: Sensus does not always honor the requested range. Any other
-    problem raises ``StatisticsValidationError`` so the caller writes nothing.
-
-    ``allow_missing_values`` lets entries without a usage value be skipped,
-    which is expected only for hours that have not settled yet.
+    Entries outside ``[window_start, window_end)`` are dropped (Sensus doesn't
+    always honor the requested range); any other problem raises. Missing usage
+    values are skipped only when ``allow_missing_values`` (unsettled hours).
     """
     ceiling = max_plausible_hourly_value(target_unit)
     values: dict[datetime, float] = {}
@@ -242,12 +210,9 @@ def process_day(  # pylint: disable=too-many-arguments,too-many-positional-argum
 ) -> tuple[dict[datetime, float], datetime | None, int]:
     """Validate one fetched local day within ``[start, cutoff)``.
 
-    Returns the day's values, the last hour of the day to write (None when
-    the day contributes nothing yet), and how many hours will be written as 0.
-
-    A fully settled day must have data, and every hour of it is written
-    (missing ones as 0). A partially settled day (today) stops at the last
-    hour Sensus has a value for; later hours are written once they settle.
+    Returns the values, the last hour to write (None if nothing yet), and how
+    many hours will be written as 0. A fully settled day must have data and is
+    written in full; a partial day (today) stops at its last available value.
     """
     day_start, day_end = local_day_bounds(day, local_tz)
     window_start = max(day_start, start)
@@ -269,10 +234,7 @@ def process_day(  # pylint: disable=too-many-arguments,too-many-positional-argum
 def build_sum_rows(
     hours: list[datetime], values: dict[datetime, float], anchor_sum: float
 ) -> list[tuple[datetime, float, float]]:
-    """Return ``(hour, state, sum)`` rows, with sums rebuilt forward from ``anchor_sum``.
-
-    Hours missing from ``values`` are written as 0.
-    """
+    """Return ``(hour, state, sum)`` rows summed forward from ``anchor_sum``; missing hours are 0."""
     rows = []
     running = anchor_sum
     for hour in hours:
@@ -295,10 +257,8 @@ def check_sum_chain(
 ) -> VerifyResult:
     """Check that rows are hourly-contiguous and each sum is the previous sum plus the state.
 
-    ``anchor_sum`` is the sum of the row immediately before the range (None
-    when the statistic has no earlier rows, in which case the chain starts
-    at 0 from the first row found). ``expected_first_hour`` is the hour the
-    range must start at when an earlier row exists.
+    ``anchor_sum`` is the sum of the row before the range, or None when there
+    is none (the chain then starts at 0 from the first row found).
     """
     previous_sum = anchor_sum if anchor_sum is not None else 0.0
     expected = expected_first_hour if anchor_sum is not None else None
@@ -394,11 +354,7 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
 
     @callback
     def async_handle_coordinator_update(self) -> None:
-        """Schedule a trailing-window sync after a successful coordinator refresh.
-
-        Skipped when neither the fetched hourly data nor the settled cutoff
-        changed since the last clean run, and while a previous run is active.
-        """
+        """Schedule a trailing-window sync after a refresh, unless nothing changed or one is running."""
         if not self.coordinator.last_update_success:
             return
         if self._poll_task is not None and not self._poll_task.done():
@@ -590,12 +546,8 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
         its queue is empty, even if a queued import is still executing, so
         queue a synchronize task behind the writes and wait for that instead.
         """
-        instance = get_instance(self.hass)
-        if SynchronizeTask is None:  # pragma: no cover - older HA cores
-            await instance.async_block_till_done()
-            return
         future = self.hass.loop.create_future()
-        instance.queue_task(SynchronizeTask(future))
+        get_instance(self.hass).queue_task(SynchronizeTask(future))
         await future
 
     async def _async_read(self, start: datetime, end: datetime | None, types: set[str]) -> list[dict[str, Any]]:

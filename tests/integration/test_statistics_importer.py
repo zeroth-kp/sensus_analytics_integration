@@ -289,29 +289,23 @@ async def test_long_sync_is_refused_when_the_floor_is_unknown(env):
 # -- time handling -----------------------------------------------------------
 
 
-async def test_fall_back_day_gets_all_25_hours(env):
-    hass, _fake, importer, freezer = env
-    freezer.move_to(datetime(2026, 11, 3, 18, 0, tzinfo=UTC))
-    start = local_day_bounds(date(2026, 10, 31), CHICAGO)[0]
-    result = await importer.async_sync(start, reason="dst")
-
-    assert result.ok, result
-    day_start, day_end = local_day_bounds(date(2026, 11, 1), CHICAGO)
-    rows = await _rows(hass, importer)
-    assert len([hour for hour, _, _ in rows if day_start <= hour < day_end]) == 25
-
-
-async def test_spring_forward_day_gets_23_hours(env):
+@pytest.mark.parametrize(
+    ("now", "first_day", "dst_day", "hours"),
+    [
+        (datetime(2026, 11, 3, 18, 0, tzinfo=UTC), date(2026, 10, 31), date(2026, 11, 1), 25),  # fall back
+        (datetime(2026, 3, 10, 18, 0, tzinfo=UTC), date(2026, 3, 7), date(2026, 3, 8), 23),  # spring forward
+    ],
+)
+async def test_dst_days_get_every_local_hour(env, now, first_day, dst_day, hours):
     hass, fake, importer, freezer = env
     fake.data_floor = date(2026, 1, 1)
-    freezer.move_to(datetime(2026, 3, 10, 18, 0, tzinfo=UTC))
-    start = local_day_bounds(date(2026, 3, 7), CHICAGO)[0]
-    result = await importer.async_sync(start, reason="dst")
+    freezer.move_to(now)
+    result = await importer.async_sync(local_day_bounds(first_day, CHICAGO)[0], reason="dst")
 
     assert result.ok, result
-    day_start, day_end = local_day_bounds(date(2026, 3, 8), CHICAGO)
+    day_start, day_end = local_day_bounds(dst_day, CHICAGO)
     rows = await _rows(hass, importer)
-    assert len([hour for hour, _, _ in rows if day_start <= hour < day_end]) == 23
+    assert len([hour for hour, _, _ in rows if day_start <= hour < day_end]) == hours
 
 
 # -- verify and Repairs ------------------------------------------------------
