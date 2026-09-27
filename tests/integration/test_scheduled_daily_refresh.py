@@ -184,7 +184,7 @@ async def test_refresh_does_not_reprocess_an_entry_outside_its_requested_window(
 
     with patch(
         "custom_components.sensus_analytics.coordinator.requests.Session",
-        return_value=SimpleNamespace(get=fake_get, post=lambda *a, **k: SimpleNamespace(status_code=302)),
+        return_value=SimpleNamespace(get=fake_get, post=lambda *a, **k: SimpleNamespace(status_code=302, headers={})),
     ):
         await coordinator.async_refresh_recent_daily_statistics(days=3)
     await async_wait_recording_done(hass)
