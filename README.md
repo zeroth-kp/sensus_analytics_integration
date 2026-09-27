@@ -1,12 +1,25 @@
-[![](https://img.shields.io/github/release/zestysoft/sensus_analytics_integration/all.svg?style=for-the-badge)](https://github.com/zestysoft/sensus_analytics_integration/releases)
-[![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge)](https://github.com/custom-components/hacs)
-[![](https://img.shields.io/github/license/zestysoft/sensus_analytics_integration?style=for-the-badge)](LICENSE)
-[![](https://img.shields.io/badge/MAINTAINER-%40zestysoft-red?style=for-the-badge)](https://github.com/zestysoft)
+[![](https://img.shields.io/github/release/zeroth-kp/sensus_analytics_integration/all.svg?style=for-the-badge)](https://github.com/zeroth-kp/sensus_analytics_integration/releases)
+[![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg?style=for-the-badge)](https://github.com/hacs/integration)
+[![](https://img.shields.io/github/license/zeroth-kp/sensus_analytics_integration?style=for-the-badge)](LICENSE)
+[![](https://img.shields.io/badge/ORIGINAL%20AUTHOR-%40zestysoft-red?style=for-the-badge)](https://github.com/zestysoft)
+[![](https://img.shields.io/badge/FORK%20MAINTAINER-%40zeroth--kp-blue?style=for-the-badge)](https://github.com/zeroth-kp)
 [![](https://img.shields.io/badge/COMMUNITY-FORUM-success?style=for-the-badge)](https://community.home-assistant.io)
 
 # HomeAssistant - Sensus Analytics Integration
 
 A custom Home Assistant integration to monitor your water usage from Sensus Analytics.
+
+## Credit and fork notice
+
+This integration was created by **[zestysoft](https://github.com/zestysoft)**. The original project, [zestysoft/sensus_analytics_integration](https://github.com/zestysoft/sensus_analytics_integration), is the foundation of everything here: the Sensus Analytics API client and login flow, the config flow, the sensor set, and the overall integration design are zestysoft's work. Thank you, zestysoft.
+
+This repository is an independently maintained fork of that project, maintained by [@zeroth-kp](https://github.com/zeroth-kp). It has been significantly modified from the original, including:
+
+- Same-day hourly data (the most recent settled hour instead of the matching hour from the previous day), with a configurable settle delay.
+- Long-term statistics import and backfill for hourly and daily water usage.
+- A progressive tiered-billing model with an included-gallons allowance and up to four tiers priced per thousand gallons.
+
+This fork is not affiliated with or endorsed by zestysoft. Please report problems with this fork to [this repository's issue tracker](https://github.com/zeroth-kp/sensus_analytics_integration/issues), not to the original project. If you want the original integration, install it from [zestysoft/sensus_analytics_integration](https://github.com/zestysoft/sensus_analytics_integration), which is available in HACS by default.
 
 ## Features
 
@@ -49,7 +62,7 @@ A custom Home Assistant integration to monitor your water usage from Sensus Anal
 
 4. **Add the Sensus Analytics Repository**
 
-   - **Repository URL**: `https://github.com/zestysoft/sensus_analytics_integration`
+   - **Repository URL**: `https://github.com/zeroth-kp/sensus_analytics_integration`
    - **Category**: Select "**Integration**" from the dropdown menu.
    - Click "**Add**".
 
@@ -122,10 +135,10 @@ Below are the sensor entities created by this integration:
 
 # Be kind
 
-If you like the integration, how about buying me a coffee? :)
+This integration exists because of zestysoft's original work. If you find it useful, consider supporting the original author:
 
 [![Buy me a coffee!](https://www.buymeacoffee.com/assets/img/custom_images/black_img.png)](https://www.buymeacoffee.com/zestysoft)
 
 ## License
 
-[Apache 2.0](LICENSE)
+[Apache 2.0](LICENSE). Original work copyright 2024 Zestysoft; modifications in this fork copyright 2026 zeroth-kp. See [NOTICE](NOTICE) for attribution details.
