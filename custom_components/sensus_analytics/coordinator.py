@@ -375,8 +375,8 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         synchronously, so a write that landed moments ago may not be visible
         yet even to this re-read. This narrows the race window from "the
         entire fetch+build phase" down to "the gap between this check and the
-        subsequent write," which is enough to catch the incident this guards
-        against - independent operations are realistically minutes apart, not
+        subsequent write," which is enough to catch the failure mode this
+        guards against - independent operations are realistically minutes apart, not
         microseconds - but does not eliminate the race at the database level.
 
         ``expected_sum`` may be ``None`` or already coerced to ``0.0`` by a
@@ -425,11 +425,11 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         24h - logging those at WARNING by default would just be noise).
         ``async_backfill_daily_history`` overrides this to WARNING: it's
         rare, operator-invoked, and reprocesses every day from its
-        cutover through today in one call (lesson #29) - the highest
-        blast-radius write this integration makes, and previously
-        left the only trace of a successful (or corrupting) run at
-        INFO, invisible at this integration's default WARNING log
-        level. A completed run of *that* call should always be visible.
+        cutover through today in one call - the highest blast-radius
+        write this integration makes. At INFO, the only trace of a
+        successful (or corrupting) run would be invisible at this
+        integration's default WARNING log level; a completed run of
+        *that* call should always be visible.
         """
         metadata = StatisticMetaData(
             has_sum=True,
@@ -859,8 +859,8 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         """Fetch daily-granularity entries (zoom=month) for an explicit local-time range.
 
         Sensus's zoom=month endpoint does not reliably honor a narrow
-        start/end window - confirmed returning entries well before a
-        requested few-day range, evidently always covering at least the
+        start/end window - it can return entries well before a requested
+        few-day range, typically covering at least the
         containing calendar month(s) regardless of how tight start/end
         are. Every entry is filtered against the requested lower bound
         before being returned, so a caller asking for a short recent

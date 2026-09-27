@@ -46,7 +46,7 @@ backfill_daily_history:
         from the start of that month through today is corrected using real
         daily figures regardless of this date.
       required: true
-      example: "2026-07-05"
+      example: "2026-01-01"
       selector:
         date: {}
     config_entry_id:
