@@ -40,6 +40,25 @@ except (ImportError, AttributeError):  # pragma: no cover - older HA cores
     _VOLUME_UNIT_CLASS = None
 
 
+def apply_sum_statistic_fields(metadata: StatisticMetaData) -> StatisticMetaData:
+    """Set the mean and unit-class fields a volume sum statistic needs on this HA core.
+
+    Populates the mean field under whichever key this core expects, and sets
+    ``unit_class`` where the core supports it.
+    """
+    if _MEAN_NONE is not None:
+        metadata["mean_type"] = _MEAN_NONE
+    else:  # pragma: no cover - older HA cores
+        metadata["has_mean"] = False
+    if _VOLUME_UNIT_CLASS is not None:
+        metadata["unit_class"] = _VOLUME_UNIT_CLASS
+    return metadata
+
+
+class SensusFetchError(Exception):
+    """A Sensus request failed at the transport or response-format level."""
+
+
 class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching data from the API."""
 
@@ -231,6 +250,59 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             )
 
         return hourly_entries
+
+    def open_session(self) -> requests.Session:
+        """Return a newly authenticated session (blocking; run in an executor)."""
+        try:
+            return self._create_authenticated_session()
+        except UpdateFailed as error:
+            raise SensusFetchError(str(error)) from error
+        except requests.exceptions.RequestException as error:
+            raise SensusFetchError(f"Authentication request failed: {error}") from error
+
+    def fetch_hourly_day(self, session: requests.Session, day) -> list | None:
+        """Fetch one local day's hourly entries (blocking; run in an executor).
+
+        Unlike ``_retrieve_hourly_data``, failures are not folded into a
+        ``None`` result, so callers can tell the cases apart:
+
+        - raises ``SensusFetchError`` for transport errors and malformed responses;
+        - returns ``None`` when Sensus answers but reports the request as unsuccessful;
+        - returns ``[]`` when Sensus answers successfully with no hourly rows.
+
+        Entries use the same shape as ``_process_hourly_data_response``. No
+        filtering is applied here - the caller validates the requested window.
+        """
+        start_ts, end_ts = self._get_start_end_timestamps(day)
+        usage_url, params = self._construct_hourly_data_request(start_ts, end_ts)
+        try:
+            response = session.get(usage_url, params=params, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+        except requests.exceptions.RequestException as error:
+            raise SensusFetchError(f"Hourly data request failed: {error}") from error
+        except ValueError as error:
+            raise SensusFetchError("Hourly data response was not valid JSON") from error
+
+        if not isinstance(payload, dict):
+            raise SensusFetchError("Hourly data response was not an object")
+        if not payload.get("operationSuccess", False):
+            return None
+
+        data = payload.get("data")
+        usage_list = data.get("usage") if isinstance(data, dict) else None
+        if not usage_list or len(usage_list) < 2:
+            return []
+        units = usage_list[0]
+        if not isinstance(units, list) or not units:
+            raise SensusFetchError("Hourly data response did not include units")
+
+        entries = []
+        for row in usage_list[1:]:
+            if not isinstance(row, list) or len(row) < 2:
+                raise SensusFetchError("Hourly data response contained a malformed row")
+            entries.append({"timestamp": row[0], "usage": row[1], "usage_unit": units[0]})
+        return entries
 
     # ------------------------------------------------------------------
     # One-time hourly-statistics backfill
@@ -438,13 +510,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
             statistic_id=statistic_id,
             unit_of_measurement=unit,
         )
-        # Populate the mean field under whichever key this HA core expects.
-        if _MEAN_NONE is not None:
-            metadata["mean_type"] = _MEAN_NONE
-        else:
-            metadata["has_mean"] = False
-        if _VOLUME_UNIT_CLASS is not None:
-            metadata["unit_class"] = _VOLUME_UNIT_CLASS
+        apply_sum_statistic_fields(metadata)
         async_import_statistics(self.hass, metadata, statistics)
         _LOGGER.log(level, "%s: imported %s statistics row(s) for %s", log_label, len(statistics), statistic_id)
         return len(statistics)
