@@ -58,3 +58,70 @@ backfill_daily_history:
       selector:
         config_entry:
           integration: sensus_analytics
+
+probe_retention:
+  name: Probe hourly data retention
+  description: >-
+    Read-only. Finds the oldest day Sensus still has hourly usage data for and
+    returns it. Nothing is written.
+  fields:
+    config_entry_id:
+      name: Account
+      description: >-
+        Optional: limit this action to a single Sensus Analytics account
+        (config entry). If omitted, applies to all configured accounts.
+      required: false
+      selector:
+        config_entry:
+          integration: sensus_analytics
+
+sync_statistics:
+  name: Sync hourly water statistics
+  description: >-
+    Rewrites the hourly water-usage statistic from the start date through the
+    most recent settled hour, rebuilding the running total and verifying it
+    afterwards. Runs automatically for the last few days after every update;
+    use this to rebuild a longer range.
+  fields:
+    start_date:
+      name: Start date
+      description: >-
+        First local day to include. Days older than the oldest day Sensus
+        still has hourly data for are skipped.
+      required: true
+      selector:
+        date:
+    config_entry_id:
+      name: Account
+      description: >-
+        Optional: limit this action to a single Sensus Analytics account
+        (config entry). If omitted, applies to all configured accounts.
+      required: false
+      selector:
+        config_entry:
+          integration: sensus_analytics
+
+verify_statistics:
+  name: Verify hourly water statistics
+  description: >-
+    Read-only. Checks that the hourly water-usage statistic has a row for every
+    hour from the start date onward and that each running total equals the
+    previous total plus that hour's usage. Returns the first problem found.
+  fields:
+    start_date:
+      name: Start date
+      description: >-
+        First local day to include. Days older than the oldest day Sensus
+        still has hourly data for are skipped.
+      required: true
+      selector:
+        date:
+    config_entry_id:
+      name: Account
+      description: >-
+        Optional: limit this action to a single Sensus Analytics account
+        (config entry). If omitted, applies to all configured accounts.
+      required: false
+      selector:
+        config_entry:
+          integration: sensus_analytics

@@ -47,5 +47,11 @@
         }
       }
     }
+  },
+  "issues": {
+    "statistics_discontinuity": {
+      "title": "Water usage statistics failed verification",
+      "description": "The hourly water-usage statistic `{statistic_id}` failed its consistency check at {hour}: {problem}. The next update re-syncs the affected range automatically; if this issue stays open, run the `sensus_analytics.sync_statistics` action from a date before {hour}."
+    }
   }
 }

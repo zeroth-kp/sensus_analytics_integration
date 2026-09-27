@@ -10,3 +10,4 @@ line_length = 120
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = ["statistics_poll: let the statistics importer's poll hook run in this test"]

@@ -7,13 +7,14 @@ from datetime import timedelta
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
 
 from .const import DOMAIN
 from .coordinator import SensusAnalyticsDataUpdateCoordinator
+from .statistics import WaterStatisticsImporter
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,6 +44,28 @@ BACKFILL_DAILY_HISTORY_SCHEMA = vol.Schema(
         vol.Required(ATTR_CUTOVER_DATE): cv.date,
         vol.Optional(ATTR_CONFIG_ENTRY_ID): str,
     }
+)
+
+
+SERVICE_PROBE_RETENTION = "probe_retention"
+SERVICE_SYNC_STATISTICS = "sync_statistics"
+SERVICE_VERIFY_STATISTICS = "verify_statistics"
+ATTR_START_DATE = "start_date"
+
+PROBE_RETENTION_SCHEMA = vol.Schema({vol.Optional(ATTR_CONFIG_ENTRY_ID): str})
+STATISTICS_RANGE_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_START_DATE): cv.date,
+        vol.Optional(ATTR_CONFIG_ENTRY_ID): str,
+    }
+)
+
+_SERVICES = (
+    SERVICE_BACKFILL_HOURLY,
+    SERVICE_BACKFILL_DAILY_HISTORY,
+    SERVICE_PROBE_RETENTION,
+    SERVICE_SYNC_STATISTICS,
+    SERVICE_VERIFY_STATISTICS,
 )
 
 
@@ -90,6 +113,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
+
+    # The hourly water statistic's single writer. Every successful refresh
+    # schedules a trailing-window sync in the background.
+    importer = WaterStatisticsImporter(hass, coordinator)
+    coordinator.statistics_importer = importer
+    entry.async_on_unload(coordinator.async_add_listener(importer.async_handle_coordinator_update))
+    importer.async_handle_coordinator_update()
 
     _async_register_services(hass)
 
@@ -143,6 +173,69 @@ def _async_register_services(hass: HomeAssistant) -> None:
             schema=BACKFILL_DAILY_HISTORY_SCHEMA,
         )
 
+    _async_register_statistics_services(hass)
+
+
+def _async_register_statistics_services(hass: HomeAssistant) -> None:
+    """Register the hourly water-statistics services (once)."""
+    if not hass.services.has_service(DOMAIN, SERVICE_PROBE_RETENTION):
+
+        async def _handle_probe_retention(call: ServiceCall) -> ServiceResponse:
+            """Report the oldest day Sensus still has hourly data for (read-only)."""
+            results = {}
+            for coordinator in _resolve_targets(hass, call.data.get(ATTR_CONFIG_ENTRY_ID), "Retention probe"):
+                results[coordinator.config_entry.entry_id] = (
+                    await coordinator.statistics_importer.async_probe_retention()
+                )
+            return {"entries": results}
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_PROBE_RETENTION,
+            _handle_probe_retention,
+            schema=PROBE_RETENTION_SCHEMA,
+            supports_response=SupportsResponse.ONLY,
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_SYNC_STATISTICS):
+
+        async def _handle_sync_statistics(call: ServiceCall) -> ServiceResponse:
+            """Rewrite the hourly water statistic from start_date through the latest settled hour."""
+            results = {}
+            for coordinator in _resolve_targets(hass, call.data.get(ATTR_CONFIG_ENTRY_ID), "Statistics sync"):
+                importer = coordinator.statistics_importer
+                start = importer.local_midnight(call.data[ATTR_START_DATE])
+                result = await importer.async_sync(start, reason="service")
+                results[coordinator.config_entry.entry_id] = result.as_dict()
+            return {"entries": results}
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SYNC_STATISTICS,
+            _handle_sync_statistics,
+            schema=STATISTICS_RANGE_SCHEMA,
+            supports_response=SupportsResponse.OPTIONAL,
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_VERIFY_STATISTICS):
+
+        async def _handle_verify_statistics(call: ServiceCall) -> ServiceResponse:
+            """Check the hourly water statistic's sum chain from start_date onward (read-only)."""
+            results = {}
+            for coordinator in _resolve_targets(hass, call.data.get(ATTR_CONFIG_ENTRY_ID), "Statistics verify"):
+                importer = coordinator.statistics_importer
+                start = importer.local_midnight(call.data[ATTR_START_DATE])
+                results[coordinator.config_entry.entry_id] = (await importer.async_verify(start)).as_dict()
+            return {"entries": results}
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_VERIFY_STATISTICS,
+            _handle_verify_statistics,
+            schema=STATISTICS_RANGE_SCHEMA,
+            supports_response=SupportsResponse.ONLY,
+        )
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a Sensus Analytics config entry."""
@@ -151,9 +244,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id)
         # Remove the services once the last config entry is gone.
         if not hass.data[DOMAIN]:
-            if hass.services.has_service(DOMAIN, SERVICE_BACKFILL_HOURLY):
-                hass.services.async_remove(DOMAIN, SERVICE_BACKFILL_HOURLY)
-            if hass.services.has_service(DOMAIN, SERVICE_BACKFILL_DAILY_HISTORY):
-                hass.services.async_remove(DOMAIN, SERVICE_BACKFILL_DAILY_HISTORY)
+            for service in _SERVICES:
+                if hass.services.has_service(DOMAIN, service):
+                    hass.services.async_remove(DOMAIN, service)
 
     return unload_ok
