@@ -3,13 +3,14 @@
 import logging
 import math
 from datetime import datetime, time, timedelta
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMeanType, StatisticMetaData
 from homeassistant.components.recorder.statistics import async_import_statistics, statistics_during_period
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -30,6 +31,46 @@ def apply_sum_statistic_fields(metadata: StatisticMetaData) -> StatisticMetaData
 
 class SensusFetchError(Exception):
     """A Sensus request failed at the transport or response-format level."""
+
+
+class SensusAuthError(SensusFetchError):
+    """Sensus rejected the username or password."""
+
+
+def check_login_response(status: int, location: str) -> None:
+    """Classify a Sensus login response; raise unless it is a successful login.
+
+    Sensus redirects on success, and on rejected credentials either redirects
+    back to the login page with an error marker (e.g. ``?error`` or
+    ``login.html#/failed`` - the marker can be in the fragment) or re-renders
+    the login form. Any other status (5xx, 429, a firewall's 403, ...) is a
+    service problem, not a credential problem, so it must not force a reauth.
+    """
+    if status == 302:
+        redirect = urlsplit(location or "")
+        markers = f"{redirect.query}#{redirect.fragment}".lower()
+        if "error" in markers or "fail" in markers:
+            raise SensusAuthError("Sensus Analytics rejected the username or password")
+        return
+    if status in (200, 401):
+        raise SensusAuthError(f"Authentication failed with status {status}")
+    raise SensusFetchError(f"Authentication request returned unexpected status {status}")
+
+
+def authenticated_session(base_url: str, username: str, password: str) -> requests.Session:
+    """Log in to Sensus and return the session (blocking; run in an executor)."""
+    session = requests.Session()
+    try:
+        response = session.post(
+            urljoin(base_url, "j_spring_security_check"),
+            data={"j_username": username, "j_password": password},
+            allow_redirects=False,
+            timeout=10,
+        )
+    except requests.exceptions.RequestException as error:
+        raise SensusFetchError(f"Authentication request failed: {error}") from error
+    check_login_response(response.status_code, response.headers.get("Location", ""))
+    return session
 
 
 def parse_hourly_rows(usage_list: list) -> list[dict]:
@@ -110,52 +151,52 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
 
             return data
 
-        except UpdateFailed as error:
-            raise error
+        except SensusAuthError as error:
+            raise ConfigEntryAuthFailed(str(error)) from error
+        except SensusFetchError as error:
+            # Outages and maintenance pages are expected; the coordinator
+            # logs the first failure and the recovery, so no traceback here.
+            raise UpdateFailed(str(error)) from error
         except Exception as error:
             _LOGGER.error("Unexpected error: %s", error)
             raise UpdateFailed(f"Unexpected error: {error}") from error
 
     def _create_authenticated_session(self):
         """Create and return an authenticated session."""
-        session = requests.Session()
-        # Authenticate and get session cookie
-        login_url = urljoin(self.base_url, "j_spring_security_check")
-        _LOGGER.debug("Authentication URL: %s", login_url)
-        r_sec = session.post(
-            login_url,
-            data={"j_username": self.username, "j_password": self.password},
-            allow_redirects=False,
-            timeout=10,
-        )
-        # Check if login was successful
-        if r_sec.status_code != 302:
-            _LOGGER.error("Authentication failed with status code %s", r_sec.status_code)
-            raise UpdateFailed("Authentication failed")
-
-        _LOGGER.debug("Authentication successful")
-        return session
+        return authenticated_session(self.base_url, self.username, self.password)
 
     def _fetch_daily_data(self, session):
         """Fetch daily meter data."""
         widget_url = urljoin(self.base_url, "water/widget/byPage")
-        _LOGGER.debug("Widget URL: %s", widget_url)
-        response = session.post(
-            widget_url,
-            json={
-                "group": "meters",
-                "accountNumber": self.account_number,
-                "deviceId": self.meter_number,
-            },
-            timeout=10,
-        )
-        response.raise_for_status()
-        data = response.json()
-        _LOGGER.debug("Raw response data: %s", data)
-        # Navigate to the specific data
-        data = data.get("widgetList")[0].get("data").get("devices")[0]
-        _LOGGER.debug("Parsed data: %s", data)
-        return data
+        try:
+            response = session.post(
+                widget_url,
+                json={
+                    "group": "meters",
+                    "accountNumber": self.account_number,
+                    "deviceId": self.meter_number,
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.exceptions.RequestException as error:
+            raise SensusFetchError(f"Daily data request failed: {error}") from error
+        except ValueError as error:
+            # An HTML maintenance or login page instead of JSON
+            raise SensusFetchError("Daily data response was not valid JSON") from error
+        _LOGGER.debug("Raw response data: %s", payload)
+        try:
+            widget_data = payload["widgetList"][0]["data"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise SensusFetchError("Daily data response did not contain meter data") from error
+        # Sensus answers "nodata" with an empty device list while its backend is having trouble
+        devices = widget_data.get("devices") if isinstance(widget_data, dict) else None
+        if not devices:
+            raise SensusFetchError(
+                "Sensus Analytics returned no meter data; the service may be temporarily unavailable"
+            )
+        return devices[0]
 
     def _retrieve_hourly_data(self, session: requests.Session, target_date: datetime):
         """Return hourly entries for a local date, or None if there are none or the fetch failed."""
@@ -197,12 +238,7 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
 
     def open_session(self) -> requests.Session:
         """Return a newly authenticated session (blocking; run in an executor)."""
-        try:
-            return self._create_authenticated_session()
-        except UpdateFailed as error:
-            raise SensusFetchError(str(error)) from error
-        except requests.exceptions.RequestException as error:
-            raise SensusFetchError(f"Authentication request failed: {error}") from error
+        return self._create_authenticated_session()
 
     def fetch_hourly_day(self, session: requests.Session, day) -> list | None:
         """Fetch one local day's hourly entries (blocking; run in an executor).

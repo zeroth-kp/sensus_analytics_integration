@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 
-import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
@@ -21,6 +20,7 @@ from .const import (
     DEFAULT_HOUR_SETTLE_DELAY_MINUTES,
     DOMAIN,
 )
+from .coordinator import SensusAuthError, SensusFetchError, authenticated_session
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,11 +46,10 @@ class SensusAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(unique_id)
             self._abort_if_unique_id_configured()
 
-            # Validate the user input (e.g., test the connection)
-            valid = await self._test_credentials(user_input)
-            if valid:
+            if error := await self._async_check_credentials(user_input):
+                errors["base"] = error
+            else:
                 return self.async_create_entry(title="Sensus Analytics", data=user_input)
-            errors["base"] = "auth"
 
         data_schema = vol.Schema(
             {
@@ -77,24 +76,44 @@ class SensusAnalyticsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return self.async_show_form(step_id="user", data_schema=data_schema, errors=errors)
 
-    async def _test_credentials(self, user_input) -> bool:
-        """Test if the provided credentials are valid."""
+    async def _async_check_credentials(self, data) -> str | None:
+        """Try to log in; return an error key for the form, or None on success."""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{user_input[CONF_BASE_URL]}/j_spring_security_check",
-                    data={
-                        "j_username": user_input[CONF_USERNAME],
-                        "j_password": user_input[CONF_PASSWORD],
-                    },
-                    allow_redirects=False,
-                    timeout=10,
-                ) as response:
-                    _LOGGER.debug("Authentication response status: %s", response.status)
-                    return response.status == 302
-        except aiohttp.ClientError as error:
-            _LOGGER.error("Error validating credentials: %s", error)
-            return False
+            await self.hass.async_add_executor_job(
+                authenticated_session, data[CONF_BASE_URL], data[CONF_USERNAME], data[CONF_PASSWORD]
+            )
+        except SensusAuthError:
+            return "auth"
+        except SensusFetchError as error:
+            _LOGGER.warning("Could not reach Sensus Analytics to check credentials: %s", error)
+            return "cannot_connect"
+        return None
+
+    async def async_step_reauth(self, _entry_data) -> FlowResult:
+        """Start reauthentication after Sensus rejected the stored credentials."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(self, user_input=None) -> FlowResult:
+        """Ask for new credentials, check them, then update and reload the entry."""
+        entry = self._get_reauth_entry()
+        errors = {}
+        if user_input is not None:
+            data = {**entry.data, **user_input}
+            if error := await self._async_check_credentials(data):
+                errors["base"] = error
+            else:
+                return self.async_update_reload_and_abort(entry, data=data)
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_USERNAME, default=entry.data.get(CONF_USERNAME)): str,
+                    vol.Required(CONF_PASSWORD): str,
+                }
+            ),
+            errors=errors,
+        )
 
     @staticmethod
     @callback

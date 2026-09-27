@@ -110,6 +110,7 @@ def make_mock_response(json_data, status_code=200):
     """Build a requests.Response-like Mock."""
     response = Mock()
     response.status_code = status_code
+    response.headers = {}
     response.json.return_value = json_data
     response.raise_for_status = Mock()
     return response

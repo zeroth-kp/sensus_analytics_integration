@@ -18,13 +18,23 @@
           "tier3_price": "Tier 3 Price",
           "service_fee": "Service Fee"
         }
+      },
+      "reauth_confirm": {
+        "title": "Sign in to Sensus Analytics again",
+        "description": "Sensus Analytics rejected the saved username or password (for example after a password change). Enter the current credentials.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
       }
     },
     "error": {
-      "auth": "Authentication failed"
+      "auth": "Sensus Analytics rejected the username or password.",
+      "cannot_connect": "Could not reach Sensus Analytics. Check the base URL, or try again later."
     },
     "abort": {
-      "already_configured": "This account is already configured."
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Credentials updated."
     }
   },
   "options": {
