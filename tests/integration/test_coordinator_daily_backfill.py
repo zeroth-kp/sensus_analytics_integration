@@ -1,10 +1,10 @@
 """Tests for the daily-history backfill window fixes:
 
-- Finding 2: the daily-granularity fetch used to be hardcoded to a fixed
+- The daily-granularity fetch used to be hardcoded to a fixed
   60-day window regardless of how old the cutover date was, silently
   leaving a gap between the monthly-aggregate backfill and the daily
   window for any cutover more than 60 days in the past.
-- Finding 5: the monthly/yearly pagination walk-back always started from
+- The monthly/yearly pagination walk-back always started from
   "now" instead of the cutover's month boundary, wastefully fetching and
   fully discarding pages whenever the cutover was more than ~1 page
   (~400 days) old.
@@ -67,7 +67,7 @@ def test_fetch_daily_entries_in_range_uses_explicit_bounds():
 def test_fetch_daily_entries_in_range_filters_response_before_the_lower_bound():
     """Sensus's zoom=month endpoint doesn't reliably honor a narrow start/end
     window - it can return entries from well before the requested range
-    (evidently always covering at least the containing calendar month(s)). A
+    (typically covering at least the containing calendar month(s)). A
     caller asking for a short recent window (the scheduled refresh's 3-day
     default, in particular) must not receive - and reprocess - entries from
     weeks earlier just because Sensus's response happened to include them.
@@ -76,18 +76,18 @@ def test_fetch_daily_entries_in_range_filters_response_before_the_lower_bound():
     end_local, so there's nothing real for that to guard against.
     """
     coordinator = _make_coordinator()
-    start_local = datetime(2026, 8, 11, tzinfo=UTC)
-    end_local = datetime(2026, 8, 14, tzinfo=UTC)
+    start_local = datetime(2026, 3, 10, tzinfo=UTC)
+    end_local = datetime(2026, 3, 13, tzinfo=UTC)
 
-    # Simulates Sensus's real behavior: the response reaches back well
+    # Simulates Sensus's zoom=month behavior: the response reaches back well
     # before the requested 3-day window even though only that window was
     # asked for. Both the in-window entry and one right at end_local's day
     # (still <= "now" in real usage, just past this test's fixed end_local)
     # should survive; only the far-older one should be filtered out.
     usage_list = [
         ["gal"],
-        [int(datetime(2026, 7, 16, 23, 0, tzinfo=UTC).timestamp() * 1000), 40415],
-        [int(datetime(2026, 8, 12, 23, 0, tzinfo=UTC).timestamp() * 1000), 90],
+        [int(datetime(2026, 2, 12, 23, 0, tzinfo=UTC).timestamp() * 1000), 25],
+        [int(datetime(2026, 3, 11, 23, 0, tzinfo=UTC).timestamp() * 1000), 90],
     ]
 
     def fake_get(url, params=None, timeout=None):

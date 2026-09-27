@@ -121,15 +121,13 @@ async def test_refresh_aborts_when_a_write_races_the_baseline(recorder_mock, ena
 async def test_refresh_does_not_reprocess_an_entry_outside_its_requested_window(
     recorder_mock, enable_custom_integrations, hass
 ):
-    """Direct regression test for the real production incident this fix
-    addresses: Sensus's zoom=month endpoint returned an entry from nearly a
-    month before the requested window, and because the scheduled refresh's
-    fetch had no response-side filtering, that entry was reprocessed and
-    silently overwrote an already-correct, much-older statistic - using a
-    baseline that was only ever valid for the narrow recent window actually
-    requested. Same signature every time it recurred: a config-entry reload
-    (which re-runs this refresh via its run-once-on-setup call) landing on
-    the exact same stale entry and rewriting the exact same wrong value.
+    """Regression test for out-of-window entries in the scheduled refresh:
+    Sensus's zoom=month endpoint can return an entry from weeks before the
+    requested window, and without response-side filtering that entry would
+    be reprocessed and silently overwrite an already-correct, much-older
+    statistic - using a baseline that was only ever valid for the narrow
+    recent window actually requested. Because the refresh also runs once on
+    setup, every config-entry reload would repeat the same bad overwrite.
     """
     from homeassistant.components.recorder import get_instance
     from homeassistant.components.recorder.models import StatisticData
@@ -150,12 +148,12 @@ async def test_refresh_does_not_reprocess_an_entry_outside_its_requested_window(
     # (23:00 *local*, not UTC) exactly, or this seeds/checks a different row
     # than the one the bug (and the fix) actually touch.
     local_tz = dt_util.get_time_zone(hass.config.time_zone)
-    old_canonical_hour = dt_util.as_utc(datetime.combine(datetime(2026, 7, 16).date(), time(23, 0), tzinfo=local_tz))
+    old_canonical_hour = dt_util.as_utc(datetime.combine(datetime(2026, 5, 10).date(), time(23, 0), tzinfo=local_tz))
     correct_old_sum = 300000.0
     coordinator._import_statistics(
         statistic_id,
         "gal",
-        [StatisticData(start=old_canonical_hour, state=33.8, sum=correct_old_sum, last_reset=old_canonical_hour)],
+        [StatisticData(start=old_canonical_hour, state=25.0, sum=correct_old_sum, last_reset=old_canonical_hour)],
         "test seed",
     )
     await hass.async_block_till_done()
@@ -163,18 +161,17 @@ async def test_refresh_does_not_reprocess_an_entry_outside_its_requested_window(
 
     now = datetime.now(timezone.utc)
     recent_entry_ts_ms = int((now - timedelta(hours=6)).timestamp() * 1000)
-    # Simulates Sensus's real behavior: zoom=month returns an entry far
-    # outside the requested narrow window (the same shape as the real
-    # incident - an entry from nearly a month earlier) alongside the
-    # genuinely-recent one the refresh actually asked for.
-    # The old entry's own value is small and plausible (matching the real
-    # incident's 33.8 gal) - it's the baseline it lands on, not the value
-    # itself, that's wrong, so this must stay under the sanity ceiling
+    # Simulates Sensus's zoom=month behavior: it returns an entry far
+    # outside the requested narrow window alongside the genuinely-recent
+    # one the refresh actually asked for.
+    # The old entry's own value is small and plausible - it's the baseline
+    # it lands on, not the value itself, that's wrong, so this must stay
+    # under the sanity ceiling
     # (_MAX_PLAUSIBLE_DAILY_USAGE_GAL) to actually exercise the date-range
     # fix rather than that unrelated, already-existing guard.
     usage_list = [
         ["gal"],
-        [int(old_canonical_hour.timestamp() * 1000), 33.8],
+        [int(old_canonical_hour.timestamp() * 1000), 25.0],
         [recent_entry_ts_ms, 90],
     ]
 
@@ -203,6 +200,7 @@ async def test_refresh_does_not_reprocess_an_entry_outside_its_requested_window(
         {"sum"},
     )
     rows = stats[statistic_id]
-    # The out-of-window 2026-07-16 entry must not have touched this row -
-    # it should still hold the value seeded above, not 40415's inflated sum.
+    # The out-of-window entry must not have touched this row - it should
+    # still hold the value seeded above, not a sum rebased onto the refresh
+    # window's baseline.
     assert rows[-1]["sum"] == pytest.approx(correct_old_sum)

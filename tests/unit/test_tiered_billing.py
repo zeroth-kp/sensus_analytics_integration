@@ -55,8 +55,8 @@ def test_unset_tier_price_stops_the_schedule():
 
 def test_no_cutoffs_or_free_allowance_matches_simple_flat_rate_config():
     """Backward compat: an install with only tier1_price set (no gallon fields)."""
-    tiers = [(None, 12.80), (None, None), (None, None), (None, None)]
-    assert calculate_tiered_cost(2500, tiers) == 2500 / 1000 * 12.80
+    tiers = [(None, 5.0), (None, None), (None, None), (None, None)]
+    assert calculate_tiered_cost(2500, tiers) == 2500 / 1000 * 5.0
 
 
 def _sensor_entity(config_data):
