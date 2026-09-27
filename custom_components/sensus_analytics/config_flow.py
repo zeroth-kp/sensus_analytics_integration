@@ -17,9 +17,12 @@ from .const import (
     CONF_HOUR_SETTLE_DELAY_MINUTES,
     CONF_METER_NUMBER,
     CONF_PASSWORD,
+    CONF_STATISTICS_TARGET,
     CONF_USERNAME,
     DEFAULT_HOUR_SETTLE_DELAY_MINUTES,
+    DEFAULT_STATISTICS_TARGET,
     DOMAIN,
+    STATISTICS_TARGETS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -186,6 +189,10 @@ class SensusAnalyticsOptionsFlow(config_entries.OptionsFlow):
                     CONF_HOUR_SETTLE_DELAY_MINUTES,
                     default=current_data.get(CONF_HOUR_SETTLE_DELAY_MINUTES, DEFAULT_HOUR_SETTLE_DELAY_MINUTES),
                 ): cv.positive_int,
+                vol.Required(
+                    CONF_STATISTICS_TARGET,
+                    default=current_data.get(CONF_STATISTICS_TARGET, DEFAULT_STATISTICS_TARGET),
+                ): vol.In(STATISTICS_TARGETS),
             }
         )
 
