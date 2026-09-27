@@ -1,4 +1,4 @@
-# Sensus Analytics Integration
+# Sensus Analytics (zeroth-kp fork)
 
 Monitor your water usage directly in Home Assistant from Sensus Analytics.
 

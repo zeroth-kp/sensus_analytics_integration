@@ -5,7 +5,7 @@
 [![](https://img.shields.io/badge/FORK%20MAINTAINER-%40zeroth--kp-blue?style=for-the-badge)](https://github.com/zeroth-kp)
 [![](https://img.shields.io/badge/COMMUNITY-FORUM-success?style=for-the-badge)](https://community.home-assistant.io)
 
-# HomeAssistant - Sensus Analytics Integration
+# HomeAssistant - Sensus Analytics (zeroth-kp fork)
 
 A custom Home Assistant integration to monitor your water usage from Sensus Analytics.
 
@@ -69,7 +69,7 @@ This fork is not affiliated with or endorsed by zestysoft. Please report problem
 5. **Install the Integration**
 
    - After adding the repository, return to the "**Integrations**" tab in HACS.
-   - Search for "**Sensus Analytics Integration**".
+   - Search for "**Sensus Analytics (zeroth-kp fork)**".
    - Click on the integration and then click "**Install**".
    - Wait for HACS to download and install the integration. You should see a confirmation message once it's complete.
 
@@ -83,7 +83,7 @@ This fork is not affiliated with or endorsed by zestysoft. Please report problem
 
    - Once Home Assistant has restarted, navigate to "**Configuration**" > "**Integrations**".
    - Click the "**+ Add Integration**" button in the bottom right corner.
-   - Search for "**Sensus Analytics**" and select "**Sensus Analytics Integration**".
+   - Search for "**Sensus Analytics**" and select "**Sensus Analytics (zeroth-kp fork)**".
    - Follow the prompts to enter your credentials and settings:
      - **Base URL**: Enter the base URL for your Sensus Analytics API (e.g., `https://<your_city>.sensus-analytics.com/`).
      - **Username**: Your Sensus Analytics account username.
