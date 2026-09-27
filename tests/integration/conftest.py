@@ -1,7 +1,10 @@
 """Shared fixtures/helpers for integration tests that need a working config entry."""
 
+import logging
 from datetime import datetime, timezone
 from unittest.mock import Mock
+
+import pytest
 
 CONFIG_ENTRY_DATA_TEMPLATE = {
     "base_url": "https://example.invalid/",
@@ -65,6 +68,42 @@ MONTHLY_RESPONSE = {
         "start": _ALIGNED_MONTH_MS,
     },
 }
+
+
+# A fixed "current time" two days after DAILY_RESPONSE's entry, so the
+# recurring refresh's trailing window (measured back from now) always
+# contains the canned data. Mid-day UTC keeps it on the same calendar date in
+# the test harness's default local time zone.
+FIXTURE_NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture
+def fixture_now(freezer):
+    """Freeze the clock at FIXTURE_NOW.
+
+    Request this *before* `recorder_mock`/`hass` so the whole Home Assistant
+    instance (and the refresh that runs once on setup) sees the frozen time
+    from the start.
+    """
+    freezer.move_to(FIXTURE_NOW)
+    return FIXTURE_NOW
+
+
+def baseline_race_errors(caplog):
+    """Return the coordinator's "baseline changed" ERROR records.
+
+    Matching on caplog.text alone is not enough: it also contains unrelated
+    recorder/event-bus debug output (e.g. `state_changed` events) whose
+    presence depends on scheduling, so a substring check could pass without
+    the abort ever having happened.
+    """
+    return [
+        record
+        for record in caplog.records
+        if record.name == "custom_components.sensus_analytics.coordinator"
+        and record.levelno == logging.ERROR
+        and "changed (was" in record.getMessage()
+    ]
 
 
 def make_mock_response(json_data, status_code=200):
