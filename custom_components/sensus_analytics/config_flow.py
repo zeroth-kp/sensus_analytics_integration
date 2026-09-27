@@ -146,13 +146,15 @@ class SensusAnalyticsOptionsFlow(config_entries.OptionsFlow):
                     "unit_type",
                     default=current_data.get("unit_type", "CCF"),
                 ): vol.In(["CCF", "gal"]),
+                # Pre-fill optional pricing fields via suggested_value rather than
+                # default, so an unset field is left out instead of validated as None.
                 vol.Optional(
                     "included_gallons",
-                    default=current_data.get("included_gallons"),
+                    description={"suggested_value": current_data.get("included_gallons")},
                 ): cv.positive_float,
                 vol.Optional(
                     "tier1_gallons",
-                    default=current_data.get("tier1_gallons"),
+                    description={"suggested_value": current_data.get("tier1_gallons")},
                 ): cv.positive_float,
                 vol.Required(
                     "tier1_price",
@@ -160,23 +162,23 @@ class SensusAnalyticsOptionsFlow(config_entries.OptionsFlow):
                 ): cv.positive_float,
                 vol.Optional(
                     "tier2_gallons",
-                    default=current_data.get("tier2_gallons"),
+                    description={"suggested_value": current_data.get("tier2_gallons")},
                 ): cv.positive_float,
                 vol.Optional(
                     "tier2_price",
-                    default=current_data.get("tier2_price"),
+                    description={"suggested_value": current_data.get("tier2_price")},
                 ): cv.positive_float,
                 vol.Optional(
                     "tier3_gallons",
-                    default=current_data.get("tier3_gallons"),
+                    description={"suggested_value": current_data.get("tier3_gallons")},
                 ): cv.positive_float,
                 vol.Optional(
                     "tier3_price",
-                    default=current_data.get("tier3_price"),
+                    description={"suggested_value": current_data.get("tier3_price")},
                 ): cv.positive_float,
                 vol.Optional(
                     "tier4_price",
-                    default=current_data.get("tier4_price"),
+                    description={"suggested_value": current_data.get("tier4_price")},
                 ): cv.positive_float,
                 vol.Required(
                     "service_fee",
