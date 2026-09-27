@@ -53,7 +53,11 @@
           "tier2_gallons": "Tier 2 Gallons",
           "tier2_price": "Tier 2 Price",
           "tier3_price": "Tier 3 Price",
-          "service_fee": "Service Fee"
+          "service_fee": "Service Fee",
+          "statistics_target": "Hourly statistics target (shadow or live)"
+        },
+        "data_description": {
+          "statistics_target": "shadow: the hourly statistics importer writes a separate statistic that nothing reads, alongside the existing statistics writers. live: the importer writes the Daily Usage sensor's own statistic and the existing writers are disabled. After switching to live, run the sync_statistics action from the oldest date you want rebuilt."
         }
       }
     }

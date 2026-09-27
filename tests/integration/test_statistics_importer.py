@@ -14,6 +14,7 @@ import pytest
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
+    async_import_statistics,
     get_metadata,
     statistics_during_period,
 )
@@ -22,7 +23,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.components.recorder.common import async_wait_recording_done
 
 from custom_components.sensus_analytics import statistics as statistics_module
-from custom_components.sensus_analytics.const import DOMAIN
+from custom_components.sensus_analytics.const import CONF_STATISTICS_TARGET, DOMAIN
 from custom_components.sensus_analytics.coordinator import SensusFetchError, StatisticData
 from custom_components.sensus_analytics.statistics import WaterStatisticsImporter, local_day_bounds
 
@@ -39,6 +40,7 @@ SETTLED_END = datetime(2026, 7, 22, 18, 0, tzinfo=UTC)
 # The poll window starts at local midnight three days back.
 POLL_START = datetime(2026, 7, 19, 5, 0, tzinfo=UTC)
 DATA_FLOOR = date(2026, 6, 1)
+LIVE_STATISTIC_ID = "sensor.sensus_analytics_daily_usage"
 
 
 def default_usage(hour: datetime) -> float:
@@ -58,6 +60,9 @@ class FakeCoordinator:
         self.requested_days: list[date] = []
         self.sessions_opened = 0
         self.data_floor = DATA_FLOOR
+
+    def daily_usage_statistic_id(self):
+        return LIVE_STATISTIC_ID
 
     def open_session(self):
         self.sessions_opened += 1
@@ -93,15 +98,42 @@ async def env(freezer, recorder_mock, hass, monkeypatch):
     return hass, fake, importer, freezer
 
 
-async def _rows(hass, importer, start=datetime(2020, 1, 1, tzinfo=UTC)):
+async def _rows(hass, importer, start=datetime(2020, 1, 1, tzinfo=UTC), statistic_id=None):
+    statistic_id = statistic_id or importer.statistic_id
     await async_wait_recording_done(hass)
     stats = await get_instance(hass).async_add_executor_job(
-        statistics_during_period, hass, start, None, {importer.statistic_id}, "hour", None, {"state", "sum"}
+        statistics_during_period, hass, start, None, {statistic_id}, "hour", None, {"state", "sum"}
     )
     return [
-        (datetime.fromtimestamp(row["start"], UTC), row["state"], row["sum"])
-        for row in stats.get(importer.statistic_id, [])
+        (datetime.fromtimestamp(row["start"], UTC), row["state"], row["sum"]) for row in stats.get(statistic_id, [])
     ]
+
+
+def _set_target(hass, fake, target, **overrides):
+    hass.config_entries.async_update_entry(
+        fake.config_entry, data=config_entry_data(unit_type="gal", **{CONF_STATISTICS_TARGET: target}, **overrides)
+    )
+
+
+async def _metadata(hass, statistic_id):
+    await async_wait_recording_done(hass)
+    metadata = await get_instance(hass).async_add_executor_job(
+        partial(get_metadata, hass, statistic_ids={statistic_id})
+    )
+    return metadata[statistic_id][1] if statistic_id in metadata else None
+
+
+def _legacy_metadata(unit="gal"):
+    """Metadata the Daily Usage statistic carries today (written by the legacy importer)."""
+    return {
+        "has_sum": True,
+        "mean_type": 0,
+        "name": None,
+        "source": "recorder",
+        "statistic_id": LIVE_STATISTIC_ID,
+        "unit_of_measurement": unit,
+        "unit_class": "volume",
+    }
 
 
 def _expected_states(start: datetime, end: datetime, overrides=None) -> list[float]:
@@ -385,3 +417,99 @@ async def test_poll_hook_skips_failed_refreshes(env):
     importer.async_handle_coordinator_update()
     assert importer._poll_task is None  # pylint: disable=protected-access
     assert fake.requested_days == []
+
+
+# -- statistics target -------------------------------------------------------
+
+
+async def test_shadow_is_the_default_target(env):
+    _hass, _fake, importer, _ = env
+    assert importer.target == "shadow"
+    assert importer.statistic_id == importer.shadow_statistic_id
+
+
+async def test_live_target_writes_the_daily_usage_statistic_with_its_existing_metadata(env):
+    hass, fake, importer, _ = env
+    _set_target(hass, fake, "live")
+    result = await importer.async_sync(POLL_START, reason="live")
+
+    assert result.ok, result
+    assert importer.statistic_id == LIVE_STATISTIC_ID
+    rows = await _rows(hass, importer)
+    assert rows[0][0] == POLL_START
+    assert await _rows(hass, importer, statistic_id=importer.shadow_statistic_id) == []
+    meta = await _metadata(hass, LIVE_STATISTIC_ID)
+    assert meta["source"] == "recorder"
+    assert meta["name"] is None
+    assert meta["has_sum"] is True
+    assert meta["unit_of_measurement"] == "gal"
+    assert meta["unit_class"] == "volume"
+
+
+async def test_live_rebuild_keeps_pre_floor_history_and_continues_its_sum(env):
+    hass, fake, importer, _ = env
+    # History older than Sensus's retention exists only in the statistic
+    # itself, as one row per day at 23:00 local.
+    pre_floor = []
+    total = 0.0
+    for day_offset in range(10, 0, -1):
+        day = DATA_FLOOR - timedelta(days=day_offset)
+        hour = local_day_bounds(day, CHICAGO)[1] - HOUR
+        total += 100.0
+        pre_floor.append(StatisticData(start=hour, state=100.0, sum=total))
+    async_import_statistics(hass, _legacy_metadata(), pre_floor)
+    await async_wait_recording_done(hass)
+    before = await _rows(hass, importer, statistic_id=LIVE_STATISTIC_ID)
+
+    _set_target(hass, fake, "live")
+    result = await importer.async_sync(datetime(2025, 1, 1, tzinfo=UTC), reason="rebuild")
+
+    assert result.ok, result
+    rows = await _rows(hass, importer)
+    floor_start = local_day_bounds(DATA_FLOOR, CHICAGO)[0]
+    assert [row for row in rows if row[0] < floor_start] == before
+    first_new = next(row for row in rows if row[0] == floor_start)
+    assert first_new[2] == pytest.approx(total + first_new[1])
+    assert result.verify.ok
+    # One-row-per-day history before the floor is not reported as missing hours.
+    assert (await importer.async_verify(datetime(2025, 1, 1, tzinfo=UTC))).ok
+
+
+async def test_live_sync_refuses_a_unit_mismatch(env):
+    hass, fake, importer, _ = env
+    async_import_statistics(
+        hass,
+        _legacy_metadata(unit="CCF"),
+        [StatisticData(start=POLL_START - 24 * HOUR, state=1.0, sum=1.0)],
+    )
+    await async_wait_recording_done(hass)
+    before = await _rows(hass, importer, statistic_id=LIVE_STATISTIC_ID)
+
+    _set_target(hass, fake, "live")
+    result = await importer.async_sync(POLL_START, reason="live")
+
+    assert not result.ok
+    assert "does not match the configured unit" in result.error
+    assert await _rows(hass, importer) == before
+
+
+async def test_unknown_target_falls_back_to_shadow(env):
+    hass, fake, importer, _ = env
+    _set_target(hass, fake, "everything")
+    assert importer.target == "shadow"
+    assert importer.statistic_id == importer.shadow_statistic_id
+
+
+@pytest.mark.statistics_poll
+async def test_switching_target_triggers_a_new_poll_sync(env):
+    hass, fake, importer, _ = env
+    importer.async_handle_coordinator_update()
+    await importer._poll_task  # pylint: disable=protected-access
+    requests_after_shadow = len(fake.requested_days)
+
+    _set_target(hass, fake, "live")
+    importer.async_handle_coordinator_update()
+    await importer._poll_task  # pylint: disable=protected-access
+
+    assert len(fake.requested_days) > requests_after_shadow
+    assert (await _rows(hass, importer))[0][0] == POLL_START

@@ -16,7 +16,17 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import VolumeConverter
 
-from .const import CONF_ACCOUNT_NUMBER, CONF_BASE_URL, CONF_METER_NUMBER, CONF_PASSWORD, CONF_USERNAME, DOMAIN
+from .const import (
+    CONF_ACCOUNT_NUMBER,
+    CONF_BASE_URL,
+    CONF_METER_NUMBER,
+    CONF_PASSWORD,
+    CONF_STATISTICS_TARGET,
+    CONF_USERNAME,
+    DEFAULT_STATISTICS_TARGET,
+    DOMAIN,
+    STATISTICS_TARGET_LIVE,
+)
 from .usage_conversion import convert_usage_value
 
 _LOGGER = logging.getLogger(__name__)
@@ -236,6 +246,32 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         }
         return usage_url, params
 
+    @property
+    def legacy_statistics_enabled(self) -> bool:
+        """Return whether the legacy statistics writers may run.
+
+        Disabled once the hourly statistics importer writes the live Daily
+        Usage statistic, so the importer is that statistic's only writer.
+        """
+        target = self.config_entry.data.get(CONF_STATISTICS_TARGET, DEFAULT_STATISTICS_TARGET)
+        return target != STATISTICS_TARGET_LIVE
+
+    def _legacy_statistics_blocked(self, log_label: str) -> bool:
+        """Log and return True when a legacy statistics writer must not run."""
+        if self.legacy_statistics_enabled:
+            return False
+        _LOGGER.warning(
+            "%s skipped: statistics_target is %r, so the hourly statistics importer is the only "
+            "writer of water statistics. Use the sync_statistics action instead.",
+            log_label,
+            STATISTICS_TARGET_LIVE,
+        )
+        return True
+
+    def daily_usage_statistic_id(self) -> str:
+        """Return the statistic id of the Daily Usage sensor."""
+        return self._resolve_daily_usage_statistic_id()
+
     def open_session(self) -> requests.Session:
         """Return a newly authenticated session (blocking; run in an executor)."""
         return self._create_authenticated_session()
@@ -286,6 +322,8 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
 
         Returns the number of hourly statistics rows imported.
         """
+        if self._legacy_statistics_blocked("Hourly backfill"):
+            return 0
         entries = await self.hass.async_add_executor_job(self._fetch_hourly_window, hours)
         if not entries:
             _LOGGER.warning("Hourly backfill: no hourly data available to import")
@@ -610,6 +648,8 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         backfill, correcting for late-settling data along the way. Returns
         the number of statistics rows imported.
         """
+        if self._legacy_statistics_blocked("Scheduled daily refresh"):
+            return 0
         local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
         now_local = datetime.now(local_tz)
         window_start_local = (now_local - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -682,6 +722,8 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         already-recorded days that were undercounted. Returns the number of
         statistics rows imported.
         """
+        if self._legacy_statistics_blocked("Daily history backfill"):
+            return 0
         local_tz = dt_util.get_time_zone(self.hass.config.time_zone)
         boundary_local = datetime.combine(cutover_date, datetime.min.time(), tzinfo=local_tz)
         boundary_month_start = boundary_local.replace(day=1)
