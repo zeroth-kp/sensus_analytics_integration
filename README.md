@@ -16,7 +16,8 @@ This integration was created by **[zestysoft](https://github.com/zestysoft)**. T
 This repository is an independently maintained fork of that project, maintained by [@zeroth-kp](https://github.com/zeroth-kp). It has been significantly modified from the original, including:
 
 - Same-day hourly data (the most recent settled hour instead of the matching hour from the previous day), with a configurable settle delay.
-- Long-term statistics import and backfill for hourly and daily water usage.
+- A single-writer, self-verifying importer for hourly water-usage long-term statistics (see [Hourly water statistics](#hourly-water-statistics)).
+- Rejected credentials open Home Assistant's re-authentication prompt, while Sensus outages and maintenance pages just retry.
 - A progressive tiered-billing model with an included-gallons allowance and up to four tiers priced per thousand gallons.
 
 This fork is not affiliated with or endorsed by zestysoft. Please report problems with this fork to [this repository's issue tracker](https://github.com/zeroth-kp/sensus_analytics_integration/issues), not to the original project. If you want the original integration, install it from [zestysoft/sensus_analytics_integration](https://github.com/zestysoft/sensus_analytics_integration), which is available in HACS by default.
@@ -34,14 +35,16 @@ This fork is not affiliated with or endorsed by zestysoft. Please report problem
 - **Billing Usage**: Total usage amount that has been billed.
 - **Billing Cost**: Total cost of the billed usage.
 - **Daily Fee**: Daily fee based on usage.
-- **Last Hour Usage**: Water usage for the last hour from the previous day.
-- **Last Hour Rainfall**: Rainfall data (in inches) for the last hour from the previous day.
-- **Last Hour Temperature**: Temperature data (in °F) for the last hour from the previous day.
-- **Last Hour Timestamp**: Timestamp of the last hour's data from the previous day.
+- **Last Hour Usage**: Water usage for the most recent settled hour (see the settle delay option).
+- **Last Hour Rainfall**: Rainfall data (in inches) for the most recent settled hour.
+- **Last Hour Temperature**: Temperature data (in °F) for the most recent settled hour.
+- **Last Hour Timestamp**: Timestamp of the most recent settled hour.
 
 ## Installation via HACS
 
 ### **Prerequisites**
+
+- **Home Assistant 2026.4 or newer.**
 
 - **HACS (Home Assistant Community Store)**: Make sure HACS is installed in your Home Assistant instance. If not, follow the [HACS Installation Guide](https://hacs.xyz/docs/installation/prerequisites).
 
@@ -113,6 +116,40 @@ This fork is not affiliated with or endorsed by zestysoft. Please report problem
 
    Read your own utility's rate schedule off your bill or its published tariff sheet - the values above are illustrative only, not real rates.
 
+## Hourly water statistics
+
+The integration keeps an hourly water-usage long-term statistic with a single writer that verifies itself:
+
+- After every update it re-syncs the last few days: it fetches hourly usage from Sensus up to the most recent **settled** hour, validates every value (a negative, implausibly large, duplicated or unconvertible hour means nothing is written), rebuilds the running total from the last stored value, and then reads the result back and checks every hour is present and every total adds up.
+- If that check ever fails, a **Repairs** issue appears in Home Assistant and the next update re-syncs the affected range.
+- Nothing is ever written before the oldest day Sensus still has hourly data for (Sensus keeps a rolling window of roughly 14 months). History older than that exists only in Home Assistant, so it is never rewritten.
+
+### Statistics target
+
+The **Hourly statistics target** option (Settings → Devices & services → Sensus Analytics → Configure) decides which statistic the importer writes:
+
+| Target | Importer writes | Older statistics writers |
+|---|---|---|
+| `shadow` (default) | a separate statistic, `sensus_analytics:<entry_id>_water_shadow`, that nothing reads | keep running unchanged |
+| `live` | the **Daily Usage** sensor's own statistic (the one the Energy dashboard uses), keeping its existing metadata | disabled - the importer is the only writer |
+
+A suggested way to adopt it: leave `shadow` on for a few days and compare the shadow statistic with Daily Usage; then take a backup, switch to `live`, and run `sensus_analytics.sync_statistics` from the oldest date you want rebuilt (switching alone does not rebuild history). If you point any dashboard cards at the Last Hour Usage statistic, point them at Daily Usage with an hourly period instead, since Last Hour Usage stops receiving statistics in `live` mode.
+
+### Actions
+
+| Action | Writes? | What it does |
+|---|---|---|
+| `sensus_analytics.probe_retention` | no | Returns the oldest day Sensus still has hourly data for. |
+| `sensus_analytics.sync_statistics` | yes | Rewrites the hourly statistic from `start_date` to the most recent settled hour, then verifies it. Returns what was written. |
+| `sensus_analytics.verify_statistics` | no | Checks the statistic from `start_date` onward and returns the first problem found, if any. |
+| `sensus_analytics.backfill_hourly_statistics`, `sensus_analytics.backfill_daily_history` | yes | Older backfill actions. They do nothing when the target is `live`. |
+
+All actions take an optional `config_entry_id` to target one account.
+
+### Signing in again
+
+If Sensus rejects the saved username or password (for example after a password change), Home Assistant shows a re-authentication prompt; enter the current credentials there. Temporary Sensus outages and maintenance pages do not trigger it - the integration just retries.
+
 ## Sensor Entities
 
 Below are the sensor entities created by this integration:
@@ -128,10 +165,10 @@ Below are the sensor entities created by this integration:
 - `sensor.sensus_analytics_billing_usage`: Total usage amount that has been billed.
 - `sensor.sensus_analytics_billing_cost`: Total cost of the billed usage.
 - `sensor.sensus_analytics_daily_fee`: Daily fee based on usage.
-- `sensor.sensus_analytics_last_hour_usage`: Water usage for the last hour from the previous day.
-- `sensor.sensus_analytics_last_hour_rainfall`: Rainfall for the last hour from the previous day.
-- `sensor.sensus_analytics_last_hour_temperature`: Temperature for the last hour from the previous day.
-- `sensor.sensus_analytics_last_hour_timestamp`: Timestamp of the last hour's data from the previous day.
+- `sensor.sensus_analytics_last_hour_usage`: Water usage for the most recent settled hour.
+- `sensor.sensus_analytics_last_hour_rainfall`: Rainfall for the most recent settled hour.
+- `sensor.sensus_analytics_last_hour_temperature`: Temperature for the most recent settled hour.
+- `sensor.sensus_analytics_last_hour_timestamp`: Timestamp of the most recent settled hour.
 
 # Be kind
 
