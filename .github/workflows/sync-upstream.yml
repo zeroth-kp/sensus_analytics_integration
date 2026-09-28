@@ -1,4 +1,4 @@
-name: Sync Upstream
+name: Upstream Review
 
 on:
   schedule:
@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  issues: write
 
 jobs:
-  sync:
+  review:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -18,60 +18,27 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
       - name: Fetch upstream
         run: |
           git remote add upstream https://github.com/zestysoft/sensus_analytics_integration.git
-          git fetch upstream main
+          git fetch --no-tags upstream main
 
-      - name: Check for new upstream commits
-        id: check
-        run: |
-          if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
-          fi
+      - name: List unreviewed upstream commits
+        id: list
+        run: echo "count=$(.github/scripts/list-upstream-commits.sh "$RUNNER_TEMP/upstream-review.md")" >> "$GITHUB_OUTPUT"
 
-      - name: Skip if an unresolved sync PR is already open
-        if: steps.check.outputs.up_to_date == 'false'
-        id: existing
+      - name: Open or update the review issue
+        if: steps.list.outputs.count != '0'
         env:
           GH_TOKEN: ${{ github.token }}
+          COUNT: ${{ steps.list.outputs.count }}
         run: |
-          open_count=$(gh pr list --search "label:upstream-sync state:open" --json number --jq 'length')
-          echo "has_open=$([ "$open_count" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-
-      - name: Create sync branch and merge upstream
-        if: steps.check.outputs.up_to_date == 'false' && steps.existing.outputs.has_open == 'false'
-        id: merge
-        run: |
-          branch="sync-upstream-$(date +%Y%m%d)"
-          git checkout -b "$branch"
-          if git merge upstream/main --no-edit; then
-            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          gh label create upstream-review --color 0E8A16 \
+            --description "Upstream commits waiting to be triaged" 2>/dev/null || true
+          title="Upstream: ${COUNT} new commit(s) to review"
+          existing="$(gh issue list --label upstream-review --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body-file "$RUNNER_TEMP/upstream-review.md"
           else
-            git add -A
-            git commit -m "Merge upstream/main (has conflicts - resolve manually)" --no-verify
-            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            gh issue create --title "$title" --label upstream-review --body-file "$RUNNER_TEMP/upstream-review.md"
           fi
-          git push origin "$branch"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-
-      - name: Open PR
-        if: steps.check.outputs.up_to_date == 'false' && steps.existing.outputs.has_open == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ "${{ steps.merge.outputs.conflict }}" = "true" ]; then
-            title="Sync upstream changes (conflicts need manual resolution)"
-            body="New commits from zestysoft/sensus_analytics_integration, merged into this branch. The merge has conflicts - resolve them locally before merging this PR."
-          else
-            title="Sync upstream changes"
-            body="New commits from zestysoft/sensus_analytics_integration, merged cleanly. Review before merging."
-          fi
-          gh pr create --title "$title" --body "$body" --base main --head "${{ steps.merge.outputs.branch }}" --label upstream-sync
