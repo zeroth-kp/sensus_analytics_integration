@@ -6,6 +6,7 @@ change individual hours, inject failures, and count requests.
 """
 
 import asyncio
+import json
 from datetime import date, datetime, timedelta, timezone
 from functools import partial
 from zoneinfo import ZoneInfo
@@ -23,6 +24,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.components.recorder.common import async_wait_recording_done
 
 from custom_components.sensus_analytics import statistics as statistics_module
+from custom_components.sensus_analytics import statistics_export
 from custom_components.sensus_analytics.const import CONF_STATISTICS_TARGET, DOMAIN
 from custom_components.sensus_analytics.coordinator import SensusFetchError, StatisticData
 from custom_components.sensus_analytics.statistics import WaterStatisticsImporter, local_day_bounds
@@ -41,6 +43,7 @@ SETTLED_END = datetime(2026, 7, 22, 18, 0, tzinfo=UTC)
 POLL_START = datetime(2026, 7, 19, 5, 0, tzinfo=UTC)
 DATA_FLOOR = date(2026, 6, 1)
 LIVE_STATISTIC_ID = "sensor.sensus_analytics_daily_usage"
+LAST_HOUR_STATISTIC_ID = "sensor.sensus_analytics_last_hour_usage"
 
 
 def default_usage(hour: datetime) -> float:
@@ -63,6 +66,9 @@ class FakeCoordinator:
 
     def daily_usage_statistic_id(self):
         return LIVE_STATISTIC_ID
+
+    def last_hour_usage_statistic_id(self):
+        return LAST_HOUR_STATISTIC_ID
 
     def open_session(self):
         self.sessions_opened += 1
@@ -513,3 +519,82 @@ async def test_switching_target_triggers_a_new_poll_sync(env):
 
     assert len(fake.requested_days) > requests_after_shadow
     assert (await _rows(hass, importer))[0][0] == POLL_START
+
+
+# -- export ------------------------------------------------------------------
+
+
+async def _seed_live_history(hass):
+    rows = [
+        StatisticData(start=POLL_START + index * HOUR, state=float(index + 1), sum=float((index + 1) * (index + 2) / 2))
+        for index in range(6)
+    ]
+    async_import_statistics(hass, _legacy_metadata(), rows)
+    await async_wait_recording_done(hass)
+
+
+async def test_export_writes_rows_and_metadata_of_each_existing_statistic(env, tmp_path):
+    hass, _fake, importer, _ = env
+    hass.config.config_dir = str(tmp_path)
+    await _seed_live_history(hass)
+    assert (await importer.async_sync(POLL_START, reason="poll")).ok
+
+    result = await importer.async_export()
+
+    assert result.ok, result
+    assert result.missing == [LAST_HOUR_STATISTIC_ID]
+    assert result.path.startswith(str(tmp_path / statistics_export.EXPORT_DIRECTORY))
+    payload = json.loads(open(result.path, encoding="utf-8").read())  # noqa: SIM115
+    assert payload["format"] == statistics_export.EXPORT_FORMAT
+    exported = {item["metadata"]["statistic_id"]: item for item in payload["statistics"]}
+    assert set(exported) == {LIVE_STATISTIC_ID, importer.shadow_statistic_id}
+    for statistic_id, item in exported.items():
+        assert item["metadata"] == await _metadata(hass, statistic_id)
+        stored = await _rows(hass, importer, statistic_id=statistic_id)
+        assert [(datetime.fromisoformat(row["start"]), row["state"], row["sum"]) for row in item["stats"]] == stored
+        assert result.statistics[statistic_id]["rows"] == len(stored)
+        assert result.statistics[statistic_id]["last_sum"] == stored[-1][2]
+
+
+async def test_an_exported_statistic_can_be_restored_exactly(env, tmp_path):
+    hass, _fake, importer, _ = env
+    hass.config.config_dir = str(tmp_path)
+    await _seed_live_history(hass)
+    before = await _rows(hass, importer, statistic_id=LIVE_STATISTIC_ID)
+    result = await importer.async_export()
+    item = next(
+        item
+        for item in json.loads(open(result.path, encoding="utf-8").read())["statistics"]  # noqa: SIM115
+        if item["metadata"]["statistic_id"] == LIVE_STATISTIC_ID
+    )
+
+    get_instance(hass).async_clear_statistics([LIVE_STATISTIC_ID])
+    await async_wait_recording_done(hass)
+    assert await _rows(hass, importer, statistic_id=LIVE_STATISTIC_ID) == []
+    restored = [
+        StatisticData(start=datetime.fromisoformat(row["start"]), state=row["state"], sum=row["sum"])
+        for row in item["stats"]
+    ]
+    async_import_statistics(hass, item["metadata"], restored)
+    await async_wait_recording_done(hass)
+
+    assert await _rows(hass, importer, statistic_id=LIVE_STATISTIC_ID) == before
+    assert await _metadata(hass, LIVE_STATISTIC_ID) == item["metadata"]
+
+
+async def test_export_reports_a_write_failure_without_leaving_a_file(env, tmp_path, monkeypatch):
+    hass, _fake, importer, _ = env
+    hass.config.config_dir = str(tmp_path)
+    await _seed_live_history(hass)
+
+    def fail(_path, _payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(statistics_export, "write_export_file", fail)
+    result = await importer.async_export()
+
+    assert not result.ok
+    assert "disk full" in result.error
+    assert result.path is None
+    assert result.statistics[LIVE_STATISTIC_ID]["rows"] == 6
+    assert not (tmp_path / statistics_export.EXPORT_DIRECTORY).exists()

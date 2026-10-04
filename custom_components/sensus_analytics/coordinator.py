@@ -272,6 +272,10 @@ class SensusAnalyticsDataUpdateCoordinator(DataUpdateCoordinator):
         """Return the statistic id of the Daily Usage sensor."""
         return self._resolve_daily_usage_statistic_id()
 
+    def last_hour_usage_statistic_id(self) -> str:
+        """Return the statistic id of the Last Hour Usage sensor."""
+        return self._resolve_usage_statistic_id()
+
     def open_session(self) -> requests.Session:
         """Return a newly authenticated session (blocking; run in an executor)."""
         return self._create_authenticated_session()
