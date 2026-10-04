@@ -1,5 +1,6 @@
-"""Integration tests for the probe_retention, sync_statistics and verify_statistics actions."""
+"""Integration tests for the probe_retention, sync_statistics, verify_statistics and export_statistics actions."""
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -9,7 +10,7 @@ from custom_components.sensus_analytics.const import DOMAIN
 
 from .conftest import config_entry_data, make_mock_session
 
-STATISTICS_SERVICES = ("probe_retention", "sync_statistics", "verify_statistics")
+STATISTICS_SERVICES = ("probe_retention", "sync_statistics", "verify_statistics", "export_statistics")
 
 
 async def _setup_entry(hass):
@@ -75,6 +76,19 @@ async def test_sync_statistics_reports_its_result(fixture_now, recorder_mock, en
     result = response["entries"][entry.entry_id]
     assert set(result) >= {"ok", "reason", "rows_written", "error", "verify"}
     assert result["reason"] == "service"
+
+
+@pytest.mark.asyncio
+async def test_export_statistics_writes_a_file_and_reports_it(
+    fixture_now, recorder_mock, enable_custom_integrations, hass, tmp_path
+):
+    hass.config.config_dir = str(tmp_path)
+    entry = await _setup_entry(hass)
+    response = await _call(hass, "export_statistics", {"config_entry_id": entry.entry_id})
+    result = response["entries"][entry.entry_id]
+    assert result["ok"] is True
+    assert result["path"].startswith(str(tmp_path))
+    assert Path(result["path"]).is_file()
 
 
 @pytest.mark.asyncio

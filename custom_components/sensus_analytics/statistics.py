@@ -53,6 +53,7 @@ from .const import (
     SYNC_TRAILING_DAYS,
 )
 from .coordinator import SensusFetchError, StatisticData, StatisticMetaData, apply_sum_statistic_fields
+from .statistics_export import ExportResult, async_export_statistics
 from .usage_conversion import convert_usage_value
 
 _LOGGER = logging.getLogger(__name__)
@@ -646,6 +647,18 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
             running_sum += state
             rows.append((row_start(row), state, round(running_sum, VALUE_PRECISION)))
         return rows
+
+    # -- export ----------------------------------------------------------
+
+    async def async_export(self) -> ExportResult:
+        """Write the Daily Usage, Last Hour Usage and shadow statistics to a file (no recorder changes)."""
+        statistic_ids = [
+            self.coordinator.daily_usage_statistic_id(),
+            self.coordinator.last_hour_usage_statistic_id(),
+            self.shadow_statistic_id,
+        ]
+        async with self._lock:
+            return await async_export_statistics(self.hass, statistic_ids, config_entry_id=self.entry.entry_id)
 
     # -- verify ----------------------------------------------------------
 

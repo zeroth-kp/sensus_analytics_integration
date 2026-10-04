@@ -125,3 +125,23 @@ verify_statistics:
       selector:
         config_entry:
           integration: sensus_analytics
+
+export_statistics:
+  name: Export water statistics
+  description: >-
+    Writes every hourly row and the stored metadata of the Daily Usage, Last
+    Hour Usage and shadow water statistics to a JSON file in the
+    sensus_analytics_exports folder of the configuration directory, in the
+    shape recorder/import_statistics accepts. Statistics are not changed. Run
+    it before switching statistics_target or rebuilding a long range, so the
+    previous rows can be restored exactly.
+  fields:
+    config_entry_id:
+      name: Account
+      description: >-
+        Optional: limit this action to a single Sensus Analytics account
+        (config entry). If omitted, applies to all configured accounts.
+      required: false
+      selector:
+        config_entry:
+          integration: sensus_analytics

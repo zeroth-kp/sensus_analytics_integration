@@ -50,9 +50,11 @@ BACKFILL_DAILY_HISTORY_SCHEMA = vol.Schema(
 SERVICE_PROBE_RETENTION = "probe_retention"
 SERVICE_SYNC_STATISTICS = "sync_statistics"
 SERVICE_VERIFY_STATISTICS = "verify_statistics"
+SERVICE_EXPORT_STATISTICS = "export_statistics"
 ATTR_START_DATE = "start_date"
 
 PROBE_RETENTION_SCHEMA = vol.Schema({vol.Optional(ATTR_CONFIG_ENTRY_ID): str})
+EXPORT_STATISTICS_SCHEMA = PROBE_RETENTION_SCHEMA
 STATISTICS_RANGE_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_START_DATE): cv.date,
@@ -66,6 +68,7 @@ _SERVICES = (
     SERVICE_PROBE_RETENTION,
     SERVICE_SYNC_STATISTICS,
     SERVICE_VERIFY_STATISTICS,
+    SERVICE_EXPORT_STATISTICS,
 )
 
 
@@ -177,6 +180,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
         )
 
     _async_register_statistics_services(hass)
+    _async_register_export_service(hass)
 
 
 def _async_register_statistics_services(hass: HomeAssistant) -> None:
@@ -237,6 +241,31 @@ def _async_register_statistics_services(hass: HomeAssistant) -> None:
             _handle_verify_statistics,
             schema=STATISTICS_RANGE_SCHEMA,
             supports_response=SupportsResponse.ONLY,
+        )
+
+
+def _async_register_export_service(hass: HomeAssistant) -> None:
+    """Register the statistics export service (once)."""
+    if not hass.services.has_service(DOMAIN, SERVICE_EXPORT_STATISTICS):
+
+        async def _handle_export_statistics(call: ServiceCall) -> ServiceResponse:
+            """Write the water statistics' rows and metadata to a JSON file (statistics unchanged)."""
+            results = {}
+            for coordinator in _resolve_targets(hass, call.data.get(ATTR_CONFIG_ENTRY_ID), "Statistics export"):
+                result = await coordinator.statistics_importer.async_export()
+                if result.ok:
+                    _LOGGER.info("Exported water statistics to %s", result.path)
+                else:
+                    _LOGGER.error("Statistics export failed: %s", result.error)
+                results[coordinator.config_entry.entry_id] = result.as_dict()
+            return {"entries": results}
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_EXPORT_STATISTICS,
+            _handle_export_statistics,
+            schema=EXPORT_STATISTICS_SCHEMA,
+            supports_response=SupportsResponse.OPTIONAL,
         )
 
 
