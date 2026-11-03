@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import StatisticData
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     async_import_statistics,
@@ -26,7 +27,7 @@ from pytest_homeassistant_custom_component.components.recorder.common import asy
 from custom_components.sensus_analytics import statistics as statistics_module
 from custom_components.sensus_analytics import statistics_export
 from custom_components.sensus_analytics.const import CONF_STATISTICS_TARGET, DOMAIN
-from custom_components.sensus_analytics.coordinator import SensusFetchError, StatisticData
+from custom_components.sensus_analytics.coordinator import SensusFetchError
 from custom_components.sensus_analytics.statistics import WaterStatisticsImporter, local_day_bounds
 
 from .conftest import config_entry_data
@@ -97,7 +98,11 @@ async def env(freezer, recorder_mock, hass, monkeypatch):
     await hass.config.async_set_time_zone("America/Chicago")
     monkeypatch.setattr(statistics_module, "FETCH_RETRY_DELAY_SECONDS", 0)
     monkeypatch.setattr(statistics_module, "FETCH_DAY_DELAY_SECONDS", 0)
-    entry = MockConfigEntry(domain=DOMAIN, data=config_entry_data(unit_type="gal"))
+    # Most tests exercise the shadow statistic, so it is set explicitly
+    # rather than relying on the default target.
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=config_entry_data(unit_type="gal", **{CONF_STATISTICS_TARGET: "shadow"})
+    )
     entry.add_to_hass(hass)
     fake = FakeCoordinator(entry)
     importer = WaterStatisticsImporter(hass, fake)
@@ -428,10 +433,12 @@ async def test_poll_hook_skips_failed_refreshes(env):
 # -- statistics target -------------------------------------------------------
 
 
-async def test_shadow_is_the_default_target(env):
-    _hass, _fake, importer, _ = env
-    assert importer.target == "shadow"
-    assert importer.statistic_id == importer.shadow_statistic_id
+async def test_live_is_the_default_target(env):
+    hass, fake, importer, _ = env
+    hass.config_entries.async_update_entry(fake.config_entry, data=config_entry_data(unit_type="gal"))
+    assert CONF_STATISTICS_TARGET not in fake.config_entry.data
+    assert importer.target == "live"
+    assert importer.statistic_id == LIVE_STATISTIC_ID
 
 
 async def test_live_target_writes_the_daily_usage_statistic_with_its_existing_metadata(env):
@@ -499,11 +506,11 @@ async def test_live_sync_refuses_a_unit_mismatch(env):
     assert await _rows(hass, importer) == before
 
 
-async def test_unknown_target_falls_back_to_shadow(env):
+async def test_unknown_target_falls_back_to_live(env):
     hass, fake, importer, _ = env
     _set_target(hass, fake, "everything")
-    assert importer.target == "shadow"
-    assert importer.statistic_id == importer.shadow_statistic_id
+    assert importer.target == "live"
+    assert importer.statistic_id == LIVE_STATISTIC_ID
 
 
 @pytest.mark.statistics_poll

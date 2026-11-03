@@ -39,7 +39,7 @@ async def test_setup_attaches_an_importer_and_registers_the_services(
 ):
     entry = await _setup_entry(hass)
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    assert coordinator.statistics_importer.statistic_id.startswith(f"{DOMAIN}:")
+    assert coordinator.statistics_importer.statistic_id == coordinator.daily_usage_statistic_id()
     for service in STATISTICS_SERVICES:
         assert hass.services.has_service(DOMAIN, service)
 

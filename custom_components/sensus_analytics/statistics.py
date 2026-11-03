@@ -7,9 +7,9 @@ idempotent and late corrections just replace values), then read the range
 back and verify the chain, raising a Repairs issue on failure. Nothing is
 written before the oldest day Sensus still has hourly data for.
 
-The ``statistics_target`` option picks the statistic: ``shadow`` (a separate
-external statistic nothing reads) or ``live`` (the Daily Usage sensor's own
-statistic, keeping its existing metadata; the legacy writers are disabled).
+The ``statistics_target`` option picks the statistic: ``live`` (the default:
+the Daily Usage sensor's own statistic, keeping its existing metadata) or
+``shadow`` (a separate external statistic nothing reads).
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from functools import partial
 from typing import Any
 
 from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     async_import_statistics,
@@ -52,7 +53,7 @@ from .const import (
     STATISTICS_TARGETS,
     SYNC_TRAILING_DAYS,
 )
-from .coordinator import SensusFetchError, StatisticData, StatisticMetaData, apply_sum_statistic_fields
+from .coordinator import SensusFetchError, apply_sum_statistic_fields
 from .statistics_export import ExportResult, async_export_statistics
 from .usage_conversion import convert_usage_value
 
@@ -331,7 +332,7 @@ class WaterStatisticsImporter:  # pylint: disable=too-many-instance-attributes
 
     @property
     def target(self) -> str:
-        """Return the configured statistics target (unknown values fall back to shadow)."""
+        """Return the configured statistics target (unknown values fall back to live)."""
         target = self.entry.data.get(CONF_STATISTICS_TARGET, DEFAULT_STATISTICS_TARGET)
         return target if target in STATISTICS_TARGETS else DEFAULT_STATISTICS_TARGET
 

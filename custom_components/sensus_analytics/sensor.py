@@ -94,8 +94,9 @@ class UsageConversionMixin:
         day can still read 0 up to an hour after they ended, only reaching
         their true value sometime after midnight. A configurable delay
         reduces how often the live sensor shows one of these provisional
-        values, though it isn't a guarantee - the nightly backfill service
-        remains the source of truth for already-recorded statistics.
+        values, though it isn't a guarantee - the hourly statistics importer,
+        which rewrites the last few days after every update, remains the
+        source of truth for recorded statistics.
         """
         hourly_data = self.coordinator.data.get("hourly_usage_data", [])
         if not hourly_data:
@@ -170,20 +171,16 @@ class SensusAnalyticsDailyUsageSensor(DynamicUnitSensorBase):
         self._attr_icon = "mdi:water"
         self._attr_device_class = SensorDeviceClass.WATER
         # Deliberately no state_class: this sensor's long-term statistics are
-        # written exclusively by async_backfill_daily_history and the
-        # recurring async_refresh_recent_daily_statistics (see
-        # coordinator.py), which derive each day's real total from Sensus's
-        # daily/monthly history endpoints rather than trusting HA's own
-        # compile-time state snapshots. Setting state_class here made HA's
-        # native recorder ALSO try to auto-compile long-term stats for this
-        # entity from its raw states, racing the coordinator's own import for
-        # the same day/hour - the loser hits `UNIQUE constraint failed:
-        # statistics.metadata_id, statistics.start_ts`, and since HA batches
-        # every entity's hourly compile into one transaction, that single
-        # collision silently blocked long-term statistics for the *entire*
-        # recorder, not just this entity. This is the same collision class
-        # already fixed above for LastHourUsageSensor, now triggered by the
-        # daily-history backfill instead of the hourly one.
+        # written exclusively by the hourly statistics importer (see
+        # statistics.py), which takes each hour's usage and timestamp from
+        # Sensus's hourly data rather than trusting HA's own compile-time
+        # state snapshots. Setting state_class here would make HA's native
+        # recorder ALSO auto-compile long-term stats for this entity from its
+        # raw states, racing the importer for the same hour - the loser hits
+        # `UNIQUE constraint failed: statistics.metadata_id,
+        # statistics.start_ts`, and since HA batches every entity's hourly
+        # compile into one transaction, that single collision silently blocks
+        # long-term statistics for the *entire* recorder, not just this entity.
 
     @property
     def native_value(self):
@@ -425,18 +422,14 @@ class LastHourUsageSensor(DynamicUnitSensorBase):
         self._attr_unique_id = f"{self._unique_id}_last_hour_usage"
         self._attr_icon = "mdi:water"
         self._attr_device_class = SensorDeviceClass.WATER
-        # Deliberately no state_class: this sensor's long-term statistics are
-        # written exclusively by async_backfill_hourly_statistics (see
-        # coordinator.py), which re-derives each hour's real timestamp from
-        # the Sensus API rather than trusting HA's own compile-time "now".
-        # Setting state_class here made HA's native recorder ALSO try to
-        # auto-compile long-term stats for this entity from its raw states,
-        # racing the coordinator's own import for the same hour - the loser
-        # hits `UNIQUE constraint failed: statistics.metadata_id,
-        # statistics.start_ts`, and since HA batches every entity's hourly
-        # compile into one transaction, that single collision silently
-        # blocked long-term statistics for the *entire* recorder, not just
-        # this entity.
+        # Deliberately no state_class: hourly usage is recorded in long-term
+        # statistics by the hourly statistics importer, on the Daily Usage
+        # statistic (see statistics.py), using each hour's real timestamp from
+        # the Sensus API. HA's native recorder compiling this sensor's raw
+        # states would file each reading under HA's compile-time "now" - an
+        # hour or more after the hour it describes, since Sensus reports each
+        # hour only after it has settled - and would duplicate usage the
+        # Daily Usage statistic already records.
 
     @property
     def native_value(self):

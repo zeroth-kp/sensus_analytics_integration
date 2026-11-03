@@ -1,7 +1,8 @@
-"""Pure unit test guarding against the SensusAnalyticsDailyUsageSensor state_class
-regression - the same recorder-collision bug already fixed for
-LastHourUsageSensor, recurring on a different entity (see coordinator.py's
-async_backfill_daily_history / async_refresh_recent_daily_statistics).
+"""Pure unit test guarding against a state_class regression on the usage sensors.
+
+HA's recorder compiling statistics from either sensor's states would collide
+with, or duplicate, what the hourly statistics importer writes (see
+statistics.py and the comments in sensor.py).
 """
 
 from types import SimpleNamespace

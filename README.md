@@ -128,12 +128,12 @@ The integration keeps an hourly water-usage long-term statistic with a single wr
 
 The **Hourly statistics target** option (Settings → Devices & services → Sensus Analytics → Configure) decides which statistic the importer writes:
 
-| Target | Importer writes | Older statistics writers |
-|---|---|---|
-| `shadow` (default) | a separate statistic, `sensus_analytics:<entry_id>_water_shadow`, that nothing reads | keep running unchanged |
-| `live` | the **Daily Usage** sensor's own statistic (the one the Energy dashboard uses), keeping its existing metadata | disabled - the importer is the only writer |
+| Target | Importer writes |
+|---|---|
+| `live` (default) | the **Daily Usage** sensor's own statistic (the one the Energy dashboard uses), keeping its existing metadata. The importer is its only writer. |
+| `shadow` | a separate statistic, `sensus_analytics:<entry_id>_water_shadow`, that nothing reads. Daily Usage's statistic is not updated while this is selected. |
 
-A suggested way to adopt it: leave `shadow` on for a few days and compare the shadow statistic with Daily Usage; then take a backup, run `sensus_analytics.export_statistics`, switch to `live`, and run `sensus_analytics.sync_statistics` from the oldest date you want rebuilt (switching alone does not rebuild history). If you point any dashboard cards at the Last Hour Usage statistic, point them at Daily Usage with an hourly period instead, since Last Hour Usage stops receiving statistics in `live` mode.
+Switching to `live`, or upgrading an entry that never saved this option, does not rebuild older history on its own: the trailing re-sync continues from the last stored total. To rebuild a longer range, take a backup, run `sensus_analytics.export_statistics`, then run `sensus_analytics.sync_statistics` from the oldest date you want rebuilt. The Last Hour Usage sensor no longer receives long-term statistics; for hourly usage charts, use the Daily Usage statistic with an hourly period.
 
 ### Actions
 
@@ -143,7 +143,6 @@ A suggested way to adopt it: leave `shadow` on for a few days and compare the sh
 | `sensus_analytics.sync_statistics` | yes | Rewrites the hourly statistic from `start_date` to the most recent settled hour, then verifies it. Returns what was written. |
 | `sensus_analytics.verify_statistics` | no | Checks the statistic from `start_date` onward and returns the first problem found, if any. |
 | `sensus_analytics.export_statistics` | no (writes a file) | Saves every hourly row and the metadata of the Daily Usage, Last Hour Usage and shadow statistics to `<config>/sensus_analytics_exports/` as JSON, in the shape `recorder/import_statistics` accepts, so they can be restored exactly. Returns the file path and per-statistic row counts. |
-| `sensus_analytics.backfill_hourly_statistics`, `sensus_analytics.backfill_daily_history` | yes | Older backfill actions. They do nothing when the target is `live`. |
 
 All actions take an optional `config_entry_id` to target one account.
 

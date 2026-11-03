@@ -1,16 +1,12 @@
-"""Pure unit tests for the shared usage conversion function and its two thin wrappers.
+"""Pure unit tests for the shared usage conversion function and the sensor wrapper.
 
 These guard against custom_components/sensus_analytics/sensor.py's
-UsageConversionMixin._convert_usage and coordinator.py's
-SensusAnalyticsDataUpdateCoordinator._convert_usage_value drifting apart
-again, the way they had before both were unified onto
-usage_conversion.convert_usage_value.
+UsageConversionMixin._convert_usage drifting apart from
+usage_conversion.convert_usage_value, which the statistics importer uses.
 """
 
 from types import SimpleNamespace
-from unittest.mock import Mock
 
-from custom_components.sensus_analytics.coordinator import SensusAnalyticsDataUpdateCoordinator
 from custom_components.sensus_analytics.sensor import UsageConversionMixin
 from custom_components.sensus_analytics.usage_conversion import convert_usage_value
 
@@ -69,14 +65,7 @@ def test_sensor_mixin_uses_explicit_usage_unit_over_coordinator_data():
     assert result == 5.0
 
 
-def test_coordinator_wrapper_delegates_to_shared_function():
-    coordinator = Mock(spec=SensusAnalyticsDataUpdateCoordinator)
-    coordinator.config_entry = SimpleNamespace(data={"unit_type": "gal"})
-    result = SensusAnalyticsDataUpdateCoordinator._convert_usage_value(coordinator, 10, "CF")
-    assert result == round(10 * 7.48052)
-
-
-def test_sensor_and_coordinator_agree_on_gal_to_gal():
+def test_sensor_and_shared_function_agree_on_gal_to_gal():
     """Regression test for the exact case that used to diverge (raw usage vs. float)."""
     entity = SimpleNamespace(
         coordinator=SimpleNamespace(
@@ -86,8 +75,6 @@ def test_sensor_and_coordinator_agree_on_gal_to_gal():
     )
     sensor_result = UsageConversionMixin._convert_usage(entity, "5")
 
-    coordinator = Mock(spec=SensusAnalyticsDataUpdateCoordinator)
-    coordinator.config_entry = SimpleNamespace(data={"unit_type": "gal"})
-    coordinator_result = SensusAnalyticsDataUpdateCoordinator._convert_usage_value(coordinator, "5", "GAL")
+    shared_result = convert_usage_value("5", "GAL", "gal")
 
-    assert sensor_result == coordinator_result == 5.0
+    assert sensor_result == shared_result == 5.0

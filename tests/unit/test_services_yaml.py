@@ -11,12 +11,8 @@ def _load_services():
     return yaml.safe_load(SERVICES_YAML.read_text())
 
 
-def test_both_services_expose_optional_config_entry_selector():
-    services = _load_services()
-    for service_name in ("backfill_hourly_statistics", "backfill_daily_history"):
-        field = services[service_name]["fields"]["config_entry_id"]
-        assert field["required"] is False
-        assert field["selector"]["config_entry"]["integration"] == "sensus_analytics"
+def test_only_the_statistics_services_are_documented():
+    assert set(_load_services()) == {"probe_retention", "sync_statistics", "verify_statistics", "export_statistics"}
 
 
 def test_statistics_services_are_documented():
