@@ -13,14 +13,14 @@ CONF_STATISTICS_TARGET = "statistics_target"
 DEFAULT_NAME = "Sensus Analytics"
 DEFAULT_HOUR_SETTLE_DELAY_MINUTES = 90
 
-# Which statistic the hourly water-statistics importer writes. "shadow" is a
-# separate statistic nothing reads, for running alongside the legacy writers;
-# "live" is the Daily Usage sensor's own statistic, and disables the legacy
-# writers so the importer is its only writer.
+# Which statistic the hourly water-statistics importer writes. "live" is the
+# Daily Usage sensor's own statistic; the importer is its only writer.
+# "shadow" is a separate statistic nothing reads, for comparing against the
+# live one; while it is selected nothing updates Daily Usage's statistic.
 STATISTICS_TARGET_SHADOW = "shadow"
 STATISTICS_TARGET_LIVE = "live"
 STATISTICS_TARGETS = (STATISTICS_TARGET_SHADOW, STATISTICS_TARGET_LIVE)
-DEFAULT_STATISTICS_TARGET = STATISTICS_TARGET_SHADOW
+DEFAULT_STATISTICS_TARGET = STATISTICS_TARGET_LIVE
 
 CF_TO_GALLON = 7.48052
 CF_PER_CCF = 100  # 1 CCF = 100 cubic feet

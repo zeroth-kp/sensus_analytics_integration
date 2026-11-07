@@ -1,15 +1,12 @@
-"""Integration tests for the statistics_target option and the legacy-writer gating it controls."""
+"""Integration tests for the statistics_target option and the services registered alongside it."""
 
-import logging
-from datetime import date
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from homeassistant.data_entry_flow import FlowResultType, InvalidData
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.sensus_analytics.const import CONF_STATISTICS_TARGET, DOMAIN
-from custom_components.sensus_analytics.coordinator import SensusAnalyticsDataUpdateCoordinator
 
 from .conftest import config_entry_data, make_mock_session
 
@@ -48,42 +45,20 @@ async def _setup_entry(hass, **overrides):
 
 
 @pytest.mark.asyncio
-async def test_legacy_writers_are_skipped_in_live_mode(
-    fixture_now, recorder_mock, enable_custom_integrations, hass, caplog
-):
-    entry = await _setup_entry(hass, **{CONF_STATISTICS_TARGET: "live"})
-    coordinator = hass.data[DOMAIN][entry.entry_id]
-    assert coordinator.legacy_statistics_enabled is False
-
-    with patch(SESSION) as session_factory, caplog.at_level(logging.WARNING):
-        assert await coordinator.async_backfill_hourly_statistics(24) == 0
-        assert await coordinator.async_refresh_recent_daily_statistics() == 0
-        assert await coordinator.async_backfill_daily_history(date(2026, 7, 1)) == 0
-
-    session_factory.assert_not_called()
-    skipped = [record for record in caplog.records if "skipped: statistics_target is 'live'" in record.getMessage()]
-    assert len(skipped) == 3
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("target", "refresh_runs"), [("shadow", True), ("live", False)])
-async def test_scheduled_daily_refresh_runs_only_in_shadow_mode(
-    fixture_now, recorder_mock, enable_custom_integrations, hass, target, refresh_runs
-):
-    with patch.object(
-        SensusAnalyticsDataUpdateCoordinator, "async_refresh_recent_daily_statistics", AsyncMock(return_value=0)
-    ) as refresh:
-        await _setup_entry(hass, **{CONF_STATISTICS_TARGET: target})
-    assert refresh.await_count == (1 if refresh_runs else 0)
-
-
-@pytest.mark.asyncio
-async def test_legacy_writers_stay_enabled_without_the_option(
-    fixture_now, recorder_mock, enable_custom_integrations, hass
-):
+async def test_live_is_the_target_without_the_option(fixture_now, recorder_mock, enable_custom_integrations, hass):
     entry = await _setup_entry(hass)
     assert CONF_STATISTICS_TARGET not in entry.data
-    assert hass.data[DOMAIN][entry.entry_id].legacy_statistics_enabled is True
+    assert hass.data[DOMAIN][entry.entry_id].statistics_importer.target == "live"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("service", ["backfill_hourly_statistics", "backfill_daily_history"])
+async def test_removed_backfill_services_are_not_registered(
+    fixture_now, recorder_mock, enable_custom_integrations, hass, service
+):
+    await _setup_entry(hass)
+    assert hass.services.has_service(DOMAIN, "sync_statistics")
+    assert not hass.services.has_service(DOMAIN, service)
 
 
 @pytest.mark.asyncio
@@ -94,17 +69,17 @@ async def test_options_flow_offers_and_saves_the_statistics_target(
     result = await hass.config_entries.options.async_init(entry.entry_id)
     assert result["type"] == FlowResultType.FORM
     field = next(key for key in result["data_schema"].schema if key == CONF_STATISTICS_TARGET)
-    assert field.default() == "shadow"
+    assert field.default() == "live"
 
     user_input = _full_options_input(entry, result)
-    user_input[CONF_STATISTICS_TARGET] = "live"
+    user_input[CONF_STATISTICS_TARGET] = "shadow"
     with patch(SESSION, return_value=make_mock_session()):
         result = await hass.config_entries.options.async_configure(result["flow_id"], user_input=user_input)
         await hass.async_block_till_done()
 
     assert result["type"] == FlowResultType.CREATE_ENTRY
-    assert entry.data[CONF_STATISTICS_TARGET] == "live"
-    assert hass.data[DOMAIN][entry.entry_id].legacy_statistics_enabled is False
+    assert entry.data[CONF_STATISTICS_TARGET] == "shadow"
+    assert hass.data[DOMAIN][entry.entry_id].statistics_importer.target == "shadow"
 
 
 @pytest.mark.asyncio

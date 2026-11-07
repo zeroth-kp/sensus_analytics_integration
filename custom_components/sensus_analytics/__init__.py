@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
 
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.event import async_track_time_interval
 
 from .const import DOMAIN
 from .coordinator import SensusAnalyticsDataUpdateCoordinator
@@ -19,33 +17,6 @@ from .statistics import WaterStatisticsImporter
 _LOGGER = logging.getLogger(__name__)
 
 ATTR_CONFIG_ENTRY_ID = "config_entry_id"
-
-# How often the Daily Usage sensor's long-term statistics are refreshed
-# automatically. It has no native state_class (see sensor.py), so without
-# this its statistics would only ever be as fresh as the last manual
-# backfill_daily_history call.
-DAILY_STATS_REFRESH_INTERVAL = timedelta(hours=24)
-
-SERVICE_BACKFILL_HOURLY = "backfill_hourly_statistics"
-ATTR_HOURS = "hours"
-
-BACKFILL_HOURLY_SCHEMA = vol.Schema(
-    {
-        vol.Optional(ATTR_HOURS, default=24): vol.All(vol.Coerce(int), vol.Range(min=1, max=168)),
-        vol.Optional(ATTR_CONFIG_ENTRY_ID): str,
-    }
-)
-
-SERVICE_BACKFILL_DAILY_HISTORY = "backfill_daily_history"
-ATTR_CUTOVER_DATE = "cutover_date"
-
-BACKFILL_DAILY_HISTORY_SCHEMA = vol.Schema(
-    {
-        vol.Required(ATTR_CUTOVER_DATE): cv.date,
-        vol.Optional(ATTR_CONFIG_ENTRY_ID): str,
-    }
-)
-
 
 SERVICE_PROBE_RETENTION = "probe_retention"
 SERVICE_SYNC_STATISTICS = "sync_statistics"
@@ -63,8 +34,6 @@ STATISTICS_RANGE_SCHEMA = vol.Schema(
 )
 
 _SERVICES = (
-    SERVICE_BACKFILL_HOURLY,
-    SERVICE_BACKFILL_DAILY_HISTORY,
     SERVICE_PROBE_RETENTION,
     SERVICE_SYNC_STATISTICS,
     SERVICE_VERIFY_STATISTICS,
@@ -126,59 +95,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _async_register_services(hass)
 
-    async def _scheduled_daily_refresh(_now=None) -> None:
-        if not coordinator.legacy_statistics_enabled:
-            # The hourly statistics importer owns the Daily Usage statistic.
-            return
-        try:
-            await coordinator.async_refresh_recent_daily_statistics()
-        except Exception:  # pylint: disable=broad-except
-            _LOGGER.exception("Scheduled daily statistics refresh failed")
-
-    entry.async_on_unload(async_track_time_interval(hass, _scheduled_daily_refresh, DAILY_STATS_REFRESH_INTERVAL))
-    # Run once immediately so statistics don't wait a full refresh interval
-    # to catch up after setup.
-    hass.async_create_task(_scheduled_daily_refresh())
-
     return True
 
 
 def _async_register_services(hass: HomeAssistant) -> None:
     """Register integration-level services (once)."""
-    if not hass.services.has_service(DOMAIN, SERVICE_BACKFILL_HOURLY):
-
-        async def _handle_backfill(call: ServiceCall) -> None:
-            """Backfill the last N hours of hourly statistics for the targeted entries."""
-            hours = call.data[ATTR_HOURS]
-            config_entry_id = call.data.get(ATTR_CONFIG_ENTRY_ID)
-            for coordinator in _resolve_targets(hass, config_entry_id, "Backfill"):
-                imported = await coordinator.async_backfill_hourly_statistics(hours)
-                _LOGGER.info("Backfilled %s hourly statistics row(s)", imported)
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_BACKFILL_HOURLY,
-            _handle_backfill,
-            schema=BACKFILL_HOURLY_SCHEMA,
-        )
-
-    if not hass.services.has_service(DOMAIN, SERVICE_BACKFILL_DAILY_HISTORY):
-
-        async def _handle_backfill_daily_history(call: ServiceCall) -> None:
-            """Backfill historical daily/monthly statistics for the targeted entries."""
-            cutover_date = call.data[ATTR_CUTOVER_DATE]
-            config_entry_id = call.data.get(ATTR_CONFIG_ENTRY_ID)
-            for coordinator in _resolve_targets(hass, config_entry_id, "Daily history backfill"):
-                imported = await coordinator.async_backfill_daily_history(cutover_date)
-                _LOGGER.info("Backfilled %s daily/monthly statistics row(s)", imported)
-
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_BACKFILL_DAILY_HISTORY,
-            _handle_backfill_daily_history,
-            schema=BACKFILL_DAILY_HISTORY_SCHEMA,
-        )
-
     _async_register_statistics_services(hass)
     _async_register_export_service(hass)
 
